@@ -1,0 +1,13 @@
+# Ignorar a pasta de dados extraídos
+data/
+
+# Ignorar o seu backup local da Versão 1 (ele continua no seu PC, mas não vai pro GitHub)
+main.go_v1.txt
+
+# Ignorar instaladores pesados (caso você decida não apagar o .msi)
+*.msi
+
+# Ignorar caches e arquivos temporários do Go
+.go-cache/
+*.exe
+*.test

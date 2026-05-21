@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  scraper:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    # O volume abaixo cria um "espelho" entre a pasta /app/data dentro do Docker 
+    # e a pasta ./data no seu computador. Assim, quando o Docker salvar o CSV lá dentro,
+    # ele aparece magicamente aqui fora para você ver!
+    volumes:
+      - ./data:/app/data
