@@ -17,3 +17,4 @@ main.go_v1.txt
 .go-cache/
 *.exe
 *.test
+.env
