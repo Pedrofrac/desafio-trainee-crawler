@@ -1,10 +1,13 @@
 # Ignorar a pasta de dados extraídos
 data/
 
-# Ignorar o seu backup local da Versão 1 (ele continua no seu PC, mas não vai pro GitHub)
+# Ignorar a pasta que contém a chave secreta da API do Gemini
+api/
+
+# Ignorar o seu backup local da Versão 1
 main.go_v1.txt
 
-# Ignorar instaladores pesados (caso você decida não apagar o .msi)
+# Ignorar instaladores pesados do Windows
 *.msi
 
 # Ignorar caches e arquivos temporários do Go
