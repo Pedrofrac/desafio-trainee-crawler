@@ -9,17 +9,28 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"time"
+
+	"github.com/gocolly/colly/v2"
 )
 
-// Estrutura do que queremos extrair do texto usando a IA
-type BookInfo struct {
-	Author string `json:"author"`
-	Year   int    `json:"year"`
-	Pages  int    `json:"pages"`
+// Estrutura para os dados BRUTOS e sujos vindo do HTML
+type RawBook struct {
+	Title           string `json:"title"`
+	PriceRaw        string `json:"price_raw"`
+	RatingRaw       string `json:"rating_raw"`
+	AvailabilityRaw string `json:"availability_raw"`
+	ImageURL        string `json:"image_url"`
 }
 
-// Função que lê a chave da API do arquivo local
+// Estrutura para receber os dados LIMPOS pela IA
+type CleanBook struct {
+	Title        string  `json:"title"`
+	Price        float64 `json:"price"`
+	Rating       int     `json:"rating"`
+	Availability string  `json:"availability"`
+	ImageURL     string  `json:"image_url"`
+}
+
 func readAPIKey() (string, error) {
 	data, err := os.ReadFile("api/key.txt")
 	if err != nil {
@@ -28,24 +39,23 @@ func readAPIKey() (string, error) {
 	return strings.TrimSpace(string(data)), nil
 }
 
-// Função que chama a API do Gemini
-func askGemini(apiKey string, description string) (BookInfo, error) {
-	// Endpoint oficial do modelo Gemini 2.5 Flash (gratuito e muito rápido)
+// Função que envia os dados brutos reais para o Gemini 2.5 limpar
+func cleanBooksWithGemini(apiKey string, rawBooks []RawBook) ([]CleanBook, error) {
+	// Usando o modelo Gemini 2.5 Flash oficial como solicitado!
 	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=%s", apiKey)
 
-	// Criamos o prompt ensinando o que queremos
-	prompt := fmt.Sprintf(`Analise o texto sobre o livro e extraia APENAS um objeto JSON com o seguinte formato:
-{
-  "author": "Nome do autor",
-  "year": ano_de_publicacao_como_numero,
-  "pages": quantidade_de_paginas_como_numero
-}
+	rawJSON, _ := json.Marshal(rawBooks)
 
-Se alguma informação não estiver no texto, coloque "Desconhecido" para texto ou 0 para número. Retorne APENAS o JSON, sem markdown ou explicações.
+	prompt := fmt.Sprintf(`Você é um limpador de dados. Eu acabei de raspar 3 livros de um site real e eles vieram com os dados brutos muito sujos do HTML. 
 
-Texto do livro: "%s"`, description)
+Sua tarefa é ler esse JSON sujo de entrada e me devolver APENAS um array JSON limpo e estruturado convertendo:
+- "price" para um número decimal (float64) puro (remova símbolos de moeda como '£' ou 'Â').
+- "rating" para um número inteiro (de 1 a 5), lendo o texto da classe CSS (ex: "star-rating Three" vira 3, "star-rating One" vira 1).
+- "availability" para um texto curto e limpo (ex: "In stock").
 
-	// Montamos o corpo da requisição exigindo que o Gemini responda em JSON
+JSON sujo para você limpar:
+%s`, string(rawJSON))
+
 	requestBody, _ := json.Marshal(map[string]interface{}{
 		"contents": []map[string]interface{}{
 			{
@@ -55,20 +65,18 @@ Texto do livro: "%s"`, description)
 			},
 		},
 		"generationConfig": map[string]interface{}{
-			"responseMimeType": "application/json", // Força o Gemini a responder em JSON puro
+			"responseMimeType": "application/json", // Exige resposta em JSON
 		},
 	})
 
-	// Fazemos a chamada HTTP para a API do Google
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer(requestBody))
 	if err != nil {
-		return BookInfo{}, err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
 
-	// Estrutura para ler a resposta padrão do Gemini
 	var geminiResponse struct {
 		Candidates []struct {
 			Content struct {
@@ -80,52 +88,77 @@ Texto do livro: "%s"`, description)
 	}
 
 	err = json.Unmarshal(body, &geminiResponse)
-	if err != nil || len(geminiResponse.Candidates) == 0 || len(geminiResponse.Candidates[0].Content.Parts) == 0 {
-		return BookInfo{}, fmt.Errorf("erro ao ler resposta do Gemini: %s", string(body))
+	if err != nil || len(geminiResponse.Candidates) == 0 {
+		return nil, fmt.Errorf("Erro ao ler resposta do Gemini: %s", string(body))
 	}
 
-	// Pega o texto JSON retornado pela IA e converte para a nossa Struct BookInfo
 	jsonText := geminiResponse.Candidates[0].Content.Parts[0].Text
-	var info BookInfo
-	err = json.Unmarshal([]byte(jsonText), &info)
+	
+	var cleanBooks []CleanBook
+	err = json.Unmarshal([]byte(jsonText), &cleanBooks)
 	if err != nil {
-		return BookInfo{}, err
+		return nil, err
 	}
 
-	return info, nil
+	return cleanBooks, nil
 }
 
 func main() {
 	fmt.Println("🔑 Carregando chave da API...")
 	apiKey, err := readAPIKey()
 	if err != nil {
-		log.Fatal("Erro ao ler chave da API em api/key.txt. Certifique-se de ter criado a pasta e o arquivo. Erro: ", err)
+		log.Fatal("Erro ao ler chave:", err)
 	}
 
-	// 3 Casos de teste com textos completamente diferentes para provar que a IA funciona!
-	testCases := []string{
-		"Este clássico foi lançado em 1925 pelo aclamado F. Scott Fitzgerald e conta com 180 páginas de pura emoção.",
-		"A fantástica aventura de J.R.R. Tolkien, publicada em 1937, O Hobbit, traz 310 páginas de dragões e magia.",
-		"Escrevendo em 1949, George Orwell chocou o mundo com 1984, um romance distópico de 328 páginas.",
-	}
+	fmt.Println("🕸️  Iniciando Colly para raspar os 3 primeiros livros reais do site...")
 
-	fmt.Println("🤖 Iniciando consultas ao Gemini AI...\n")
+	c := colly.NewCollector(
+		colly.AllowedDomains("books.toscrape.com"),
+	)
 
-	for i, text := range testCases {
-		fmt.Printf("--- Teste %d ---\nTexto Original: \"%s\"\n", i+1, text)
-		
-		// Espera 1 segundo entre chamadas para respeitar o limite gratuito da API
-		time.Sleep(1 * time.Second)
+	var rawBooks []RawBook
+	count := 0
 
-		info, err := askGemini(apiKey, text)
-		if err != nil {
-			fmt.Println("❌ Erro na consulta:", err)
-			continue
+	// Captura os dados exatamente como vieram do HTML (sujos)
+	c.OnHTML("article.product_pod", func(e *colly.HTMLElement) {
+		if count < 3 {
+			title := e.ChildAttr("h3 a", "title")
+			priceRaw := e.ChildText(".price_color")
+			availabilityRaw := e.ChildText(".instock.availability")
+			imageURL := e.Request.AbsoluteURL(e.ChildAttr(".image_container img", "src"))
+			ratingRaw := e.ChildAttr("p.star-rating", "class")
+
+			rawBooks = append(rawBooks, RawBook{
+				Title:           title,
+				PriceRaw:        priceRaw,
+				RatingRaw:       ratingRaw,
+				AvailabilityRaw: availabilityRaw,
+				ImageURL:        imageURL,
+			})
+			count++
 		}
+	})
 
-		fmt.Println("✨ Resposta Estruturada pela IA:")
-		fmt.Printf("   ✍️ Autor: %s\n", info.Author)
-		fmt.Printf("   📅 Ano: %d\n", info.Year)
-		fmt.Printf("   📖 Páginas: %d\n\n", info.Pages)
+	// Visita a página inicial real do site
+	err = c.Visit("https://books.toscrape.com/catalogue/page-1.html")
+	if err != nil {
+		log.Fatal("Erro ao raspar o site:", err)
+	}
+
+	fmt.Printf("📦 Capturados %d livros reais do HTML. Enviando para o Gemini 2.5 Flash limpar...\n", len(rawBooks))
+
+	// Envia os dados reais do site para a IA limpar
+	cleanBooks, err := cleanBooksWithGemini(apiKey, rawBooks)
+	if err != nil {
+		log.Fatal("❌ Erro ao processar dados com o Gemini 2.5: ", err)
+	}
+
+	fmt.Println("\n✨ Dados Reais extraídos do site e LIMPOS de forma inteligente pelo Gemini 2.5:")
+	for i, book := range cleanBooks {
+		fmt.Printf("\n--- Livro %d ---\n", i+1)
+		fmt.Printf("📖 Título: %s\n", book.Title)
+		fmt.Printf("💵 Preço: R$ %.2f\n", book.Price)
+		fmt.Printf("⭐ Rating: %d Estrelas\n", book.Rating)
+		fmt.Printf("📦 Status: %s\n", book.Availability)
 	}
 }
