@@ -7,6 +7,9 @@ api/
 # Ignorar o seu backup local da Versão 1
 main.go_v1.txt
 
+# Ignorar o cache local de modulos do Go configurado na pipeline
+.go/
+
 # Ignorar instaladores pesados do Windows
 *.msi
 

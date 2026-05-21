@@ -1,139 +1,258 @@
 package main
 
 import (
+	"bufio"
+	"database/sql"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gocolly/colly/v2"
+	_ "github.com/lib/pq"
 )
 
-// Book representa a estrutura dos dados
 type Book struct {
 	Title        string  `json:"title"`
-	Price        float64 `json:"price"` // Mudamos para número (float64)
+	Price        float64 `json:"price"`
 	Rating       int     `json:"rating"`
 	Availability string  `json:"availability"`
 	ImageURL     string  `json:"image_url"`
 }
 
-// mapRating converte a classe CSS para número
-func mapRating(classStr string) int {
-	ratings := map[string]int{
-		"One":   1,
-		"Two":   2,
-		"Three": 3,
-		"Four":  4,
-		"Five":  5,
-	}
-	parts := strings.Split(classStr, " ")
-	if len(parts) == 2 {
-		return ratings[parts[1]]
-	}
-	return 0
+var priceRegex = regexp.MustCompile(`[0-9]+(?:\.[0-9]{1,2})?`)
+
+var ratingsMap = map[string]int{
+	"One":   1,
+	"Two":   2,
+	"Three": 3,
+	"Four":  4,
+	"Five":  5,
 }
 
-// cleanPrice remove os símbolos de moeda e converte para float
 func cleanPrice(priceStr string) float64 {
-	// Remove o símbolo de libra e o caractere 'Â' que costuma bugar no terminal
-	clean := strings.ReplaceAll(priceStr, "£", "")
-	clean = strings.ReplaceAll(clean, "Â", "")
-	clean = strings.TrimSpace(clean)
-
-	val, err := strconv.ParseFloat(clean, 64)
+	match := priceRegex.FindString(priceStr)
+	val, err := strconv.ParseFloat(match, 64)
 	if err != nil {
 		return 0.0
 	}
 	return val
 }
 
-func main() {
-	c := colly.NewCollector(
-		colly.AllowedDomains("books.toscrape.com"),
-		colly.UserAgent("Trainee-Scraper-Bot/1.0 (+https://meu-portfolio.com)"),
-	)
+func mapRating(classStr string) int {
+	parts := strings.Fields(classStr)
+	for _, part := range parts {
+		if val, ok := ratingsMap[part]; ok {
+			return val
+		}
+	}
+	return 0
+}
 
-	c.Limit(&colly.LimitRule{
-		DomainGlob:  "*books.toscrape.com*",
-		Delay:       1 * time.Second,
-		RandomDelay: 500 * time.Millisecond,
-	})
+func setupDatabase() (*sql.DB, error) {
+	dbHost := os.Getenv("DB_HOST")
+	if dbHost == "" { dbHost = "localhost" }
+	
+	dbUser := os.Getenv("POSTGRES_USER")
+	dbPass := os.Getenv("POSTGRES_PASSWORD")
+	dbName := os.Getenv("POSTGRES_DB")
 
-	var books []Book
+	if dbUser == "" || dbPass == "" || dbName == "" {
+		return nil, fmt.Errorf("credenciais de banco de dados ausentes (defina POSTGRES_USER, POSTGRES_PASSWORD e POSTGRES_DB)")
+	}
 
-	c.OnHTML("article.product_pod", func(e *colly.HTMLElement) {
-		title := e.ChildAttr("h3 a", "title")
+	connStr := fmt.Sprintf("postgres://%s:%s@%s:5432/%s?sslmode=disable", dbUser, dbPass, dbHost, dbName)
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		return nil, fmt.Errorf("erro ao abrir conexao: %w", err)
+	}
+
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("erro de ping no banco: %w", err)
+	}
+
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS books (
+		id SERIAL PRIMARY KEY, title TEXT, price NUMERIC, rating INT, availability TEXT, image_url TEXT UNIQUE
+	)`)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("erro ao criar tabela: %w", err)
+	}
+
+	return db, nil
+}
+
+func startPipeline(db *sql.DB, csvWriter *csv.Writer, jsonFile *os.File) (chan<- Book, *sync.WaitGroup) {
+	booksChan := make(chan Book, 100)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
 		
-		// Usamos a nossa função nova para limpar o preço
-		priceRaw := e.ChildText(".price_color")
-		price := cleanPrice(priceRaw)
-		
-		availability := strings.TrimSpace(e.ChildText(".instock.availability"))
-		imageURL := e.ChildAttr(".image_container img", "src")
-		ratingClass := e.ChildAttr("p.star-rating", "class")
+		var tx *sql.Tx
+		var stmt *sql.Stmt
+		var err error
 
-		book := Book{
-			Title:        title,
-			Price:        price,
-			Rating:       mapRating(ratingClass),
-			Availability: availability,
-			ImageURL:     e.Request.AbsoluteURL(imageURL),
+		if db != nil {
+			tx, err = db.Begin()
+			if err != nil {
+				log.Printf("Erro ao iniciar transacao: %v", err)
+			}
 		}
 
-		books = append(books, book)
-		fmt.Printf("Extraído: %s | Preço: %.2f | Estrelas: %d\n", book.Title, book.Price, book.Rating)
+		if tx != nil {
+			defer tx.Rollback()
+			stmt, err = tx.Prepare("INSERT INTO books (title, price, rating, availability, image_url) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (image_url) DO NOTHING")
+			if err != nil {
+				log.Printf("Erro ao preparar statement: %v", err)
+			} else {
+				defer stmt.Close()
+			}
+		}
+
+		jsonWriter := bufio.NewWriter(jsonFile)
+
+		if _, err := jsonWriter.Write([]byte("[\n")); err != nil {
+			log.Printf("Erro ao inicializar arquivo JSON: %v", err)
+		}
+
+		first := true
+		totalBooks := 0
+
+		for b := range booksChan {
+			totalBooks++
+
+			if err := csvWriter.Write([]string{b.Title, fmt.Sprintf("%.2f", b.Price), strconv.Itoa(b.Rating), b.Availability, b.ImageURL}); err != nil {
+				log.Printf("Erro ao escrever CSV: %v", err)
+			}
+
+			if !first {
+				if _, err := jsonWriter.Write([]byte(",\n")); err != nil {
+					log.Printf("Erro ao escrever delimitador JSON: %v", err)
+				}
+			} else {
+				first = false
+			}
+
+			data, err := json.Marshal(b)
+			if err != nil {
+				log.Printf("Erro ao serializar JSON: %v", err)
+			} else {
+				if _, err := jsonWriter.Write(data); err != nil {
+					log.Printf("Erro ao gravar dados JSON no buffer: %v", err)
+				}
+			}
+
+			if stmt != nil {
+				if _, err := stmt.Exec(b.Title, b.Price, b.Rating, b.Availability, b.ImageURL); err != nil {
+					log.Printf("Erro isolado no DB (Linha ignorada): %v", err)
+				}
+			}
+		}
+
+		csvWriter.Flush()
+		
+		// Correcao: Validacao de erros pendentes de gravacao no buffer do CSV
+		if err := csvWriter.Error(); err != nil {
+			log.Printf("Erro de gravacao pendente no CSV: %v", err)
+		}
+		
+		if _, err := jsonWriter.Write([]byte("\n]\n")); err != nil {
+			log.Printf("Erro ao escrever fechamento JSON: %v", err)
+		}
+
+		if err := jsonWriter.Flush(); err != nil {
+			log.Printf("Erro ao dar flush no buffer do JSON: %v", err)
+		}
+
+		if tx != nil && stmt != nil {
+			if err := tx.Commit(); err != nil {
+				log.Printf("Erro ao comitar transacao de DB: %v", err)
+			}
+		}
+	}()
+
+	return booksChan, &wg
+}
+
+func main() {
+	db, err := setupDatabase()
+	if err != nil {
+		log.Printf("Aviso: Banco indisponivel. Operando apenas com I/O de disco. Detalhe: %v", err)
+	} else {
+		defer db.Close()
+	}
+
+	if err := os.MkdirAll("data", 0750); err != nil {
+		log.Printf("Erro fatal ao criar diretorio data: %v", err)
+		return
+	}
+
+	fileCSV, err := os.Create("data/books.csv")
+	if err != nil {
+		log.Printf("Erro ao criar arquivo CSV: %v", err)
+		return
+	}
+	defer fileCSV.Close()
+
+	csvWriter := csv.NewWriter(fileCSV)
+	if err := csvWriter.Write([]string{"Title", "Price", "Rating", "Availability", "ImageURL"}); err != nil {
+		log.Printf("Erro ao escrever cabecalho CSV: %v", err)
+		return
+	}
+
+	fileJSON, err := os.Create("data/books.json")
+	if err != nil {
+		log.Printf("Erro ao criar arquivo JSON: %v", err)
+		return
+	}
+	defer fileJSON.Close()
+
+	booksChan, wg := startPipeline(db, csvWriter, fileJSON)
+
+	c := colly.NewCollector(
+		colly.AllowedDomains("books.toscrape.com"),
+		colly.UserAgent("Scraper-Bot/9.0"),
+		colly.Async(true),
+	)
+
+	if err := c.Limit(&colly.LimitRule{DomainGlob: "*books.toscrape.com*", Parallelism: 2, RandomDelay: 1 * time.Second}); err != nil {
+		log.Printf("Erro ao configurar regras do Colly: %v", err)
+		return
+	}
+
+	c.OnHTML("article.product_pod", func(e *colly.HTMLElement) {
+		book := Book{
+			Title:        e.ChildAttr("h3 a", "title"),
+			Price:        cleanPrice(e.ChildText(".price_color")),
+			Rating:       mapRating(e.ChildAttr("p.star-rating", "class")),
+			Availability: strings.TrimSpace(e.ChildText(".instock.availability")),
+			ImageURL:     e.Request.AbsoluteURL(e.ChildAttr(".image_container img", "src")),
+		}
+		booksChan <- book 
 	})
 
 	c.OnHTML("li.next a", func(e *colly.HTMLElement) {
-		absoluteURL := e.Request.AbsoluteURL(e.Attr("href"))
-		fmt.Printf("\n---> Indo para a próxima página: %s\n\n", absoluteURL)
-		err := c.Visit(absoluteURL)
-		if err != nil {
-			log.Println("Erro ao visitar próxima página:", err)
+		if err := e.Request.Visit(e.Attr("href")); err != nil {
+			log.Printf("Erro de rede ao buscar proxima pagina: %v", err)
 		}
 	})
 
-	// Inicia o Crawler
-	err := c.Visit("https://books.toscrape.com/catalogue/page-1.html")
-	if err != nil {
-		log.Fatal("Erro fatal ao iniciar:", err)
+	log.Println("Iniciando varredura...")
+	if err := c.Visit("https://books.toscrape.com/catalogue/page-1.html"); err != nil {
+		log.Printf("Erro fatal ao acessar o site: %v", err)
+		return
 	}
 
-	fmt.Printf("\n=== RESUMO ===\nTotal de livros extraídos: %d\n", len(books))
-
-	// ---- ETAPA 2: SALVAR OS DADOS ----
-	os.MkdirAll("data", os.ModePerm) // Cria a pasta "data"
-
-	// Salva JSON
-	fileJSON, _ := os.Create("data/books.json")
-	defer fileJSON.Close()
-	encoder := json.NewEncoder(fileJSON)
-	encoder.SetIndent("", "  ")
-	encoder.Encode(books)
-	fmt.Println("✅ Arquivo books.json salvo na pasta data!")
-
-	// Salva CSV
-	fileCSV, _ := os.Create("data/books.csv")
-	defer fileCSV.Close()
-	writer := csv.NewWriter(fileCSV)
-	defer writer.Flush()
-	
-	// Cabeçalho do CSV
-	writer.Write([]string{"Title", "Price", "Rating", "Availability", "ImageURL"})
-	// Linhas do CSV
-	for _, b := range books {
-		writer.Write([]string{
-			b.Title,
-			fmt.Sprintf("%.2f", b.Price),
-			strconv.Itoa(b.Rating),
-			b.Availability,
-			b.ImageURL,
-		})
-	}
-	fmt.Println("✅ Arquivo books.csv salvo na pasta data!")
+	c.Wait()         
+	close(booksChan) 
+	wg.Wait()        
 }
