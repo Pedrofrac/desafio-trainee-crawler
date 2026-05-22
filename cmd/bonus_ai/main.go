@@ -91,7 +91,7 @@ func run() error {
 		return fmt.Errorf("erro no limit do coletor 2: %w", err)
 	}
 
-	c2.OnHTML("#content_inner > article > p", func(e *colly.HTMLElement) {
+	c2.OnHTML(`#product_description + p`, func(e *colly.HTMLElement) {
 		description = e.Text
 	})
 
@@ -175,7 +175,12 @@ func run() error {
 	}
 
 	if respErr != nil || resp == nil || resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("erro persistente na API do Gemini apos o limite de tentativas de retry")
+		if resp != nil {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return fmt.Errorf("erro persistente na API do Gemini apos o limite de tentativas de retry (Status %d): %s", resp.StatusCode, string(bodyBytes))
+		}
+		return fmt.Errorf("erro persistente na API do Gemini apos o limite de tentativas de retry: %w", respErr)
 	}
 	defer resp.Body.Close()
 

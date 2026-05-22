@@ -12,8 +12,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o scraper cmd/scraper/main.go
 # ESTÁGIO 2: Final (Imagem de Produção Segura K8s Compliant)
 # ==========================================
 FROM alpine:latest
+RUN apk --no-cache add ca-certificates su-exec chromium
 # ca-certificates para chamadas de rede estritas; su-exec para compatibilidade
-RUN apk --no-cache add ca-certificates su-exec
 
 # Criação estática do usuário não-root (Segurança corporativa K8s Compliant)
 RUN addgroup -g 1000 appgroup && \

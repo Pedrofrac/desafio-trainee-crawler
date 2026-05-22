@@ -1,6 +1,7 @@
 package main
 
 import (
+	_ "github.com/lib/pq"
 	"context"
 	"database/sql"
 	"encoding/csv"
@@ -11,7 +12,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,10 +30,7 @@ type Book struct {
 }
 
 var (
-	// Compilada globalmente para evitar queima de CPU em loops
-	nonNumericRegex = regexp.MustCompile(`[^\d.,]`)
-
-	ratingsMap = map[string]int{
+		ratingsMap = map[string]int{
 		"one":   1,
 		"two":   2,
 		"three": 3,
@@ -43,44 +40,87 @@ var (
 )
 
 func cleanPrice(priceStr string) (float64, error) {
-	cleaned := nonNumericRegex.ReplaceAllString(priceStr, "")
-	if cleaned == "" {
-		return 0.0, fmt.Errorf("padrao de preco nao encontrado no texto: %s", priceStr)
+	// Remover espacos iniciais/finais redundantes
+	trimmed := strings.TrimSpace(priceStr)
+	if trimmed == "" {
+		return 0.0, fmt.Errorf("string de preco vazia")
 	}
 
-	lastDot := strings.LastIndex(cleaned, ".")
-	lastComma := strings.LastIndex(cleaned, ",")
-
-	sepIndex := lastDot
-	if lastComma > lastDot {
-		sepIndex = lastComma
+	// Filtrar apenas caracteres numericos, ponto e virgula
+	var sb strings.Builder
+	for _, r := range trimmed {
+		if (r >= '0' && r <= '9') || r == '.' || r == ',' {
+			sb.WriteRune(r)
+		}
+	}
+	cleaned := sb.String()
+	if len(cleaned) == 0 {
+		return 0.0, fmt.Errorf("nenhum caractere numerico ou separador encontrado em %q", priceStr)
 	}
 
-	var integerPart, fractionalPart string
+	// Localizar o indice do ultimo caractere nao alfanumerico (ponto ou virgula)
+	lastIdx := -1
+	for i := len(cleaned) - 1; i >= 0; i-- {
+		if cleaned[i] == '.' || cleaned[i] == ',' {
+			lastIdx = i
+			break
+		}
+	}
 
-	// Se houver um separador e ele estiver exatamente a 2 posições do final, é uma casa decimal
-	if sepIndex != -1 && len(cleaned)-1-sepIndex == 2 {
-		integerPart = cleaned[:sepIndex]
-		fractionalPart = cleaned[sepIndex+1:]
+	var integerPart, decimalPart string
+	if lastIdx != -1 {
+		// Parte inteira e tudo a esquerda do ultimo separador
+		left := cleaned[:lastIdx]
+		// Parte decimal e tudo a direita do ultimo separador
+		right := cleaned[lastIdx+1:]
+
+		// Limpar a parte inteira de outros separadores (milhar) mantendo apenas digitos
+		var intSb strings.Builder
+		for _, r := range left {
+			if r >= '0' && r <= '9' {
+				intSb.WriteRune(r)
+			}
+		}
+		integerPart = intSb.String()
+
+		// Limpar a parte decimal para conter apenas digitos
+		var decSb strings.Builder
+		for _, r := range right {
+			if r >= '0' && r <= '9' {
+				decSb.WriteRune(r)
+			}
+		}
+		decimalPart = decSb.String()
 	} else {
-		// Caso contrário, são apenas separadores de milhar (ex: 1,000 ou 1.000) ou um número inteiro
-		integerPart = cleaned
-		fractionalPart = "00"
+		// Sem separador decimal explicito, trata a string inteira limpa como inteiro
+		var intSb strings.Builder
+		for _, r := range cleaned {
+			if r >= '0' && r <= '9' {
+				intSb.WriteRune(r)
+			}
+		}
+		integerPart = intSb.String()
 	}
 
-	// Remove todos os separadores remanescentes da parte inteira
-	integerPart = strings.ReplaceAll(integerPart, ".", "")
-	integerPart = strings.ReplaceAll(integerPart, ",", "")
+	// Validacao final da reconstrucao numerica
+	if integerPart == "" && decimalPart == "" {
+		return 0.0, fmt.Errorf("falha ao sanitizar partes inteira e decimal de %q", priceStr)
+	}
 
 	if integerPart == "" {
 		integerPart = "0"
 	}
 
-	finalStr := integerPart + "." + fractionalPart
+	finalStr := integerPart
+	if decimalPart != "" {
+		finalStr += "." + decimalPart
+	}
+
 	val, err := strconv.ParseFloat(finalStr, 64)
 	if err != nil {
-		return 0.0, fmt.Errorf("erro ao converter preco para float: %w", err)
+		return 0.0, fmt.Errorf("falha ao converter valor formatado %q em float64: %w", finalStr, err)
 	}
+
 	return val, nil
 }
 
@@ -171,36 +211,44 @@ func saveBooksInBatch(ctx context.Context, db *sql.DB, batch []Book) []Book {
 
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		slog.Error("Erro ao iniciar transacao no banco", "erro", err)
+		slog.Error("falha ao iniciar transacao para insercao em lote", "erro", err)
 		return batch
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.PrepareContext(ctx, "INSERT INTO books (title, price, rating, availability, image_url) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (image_url) DO NOTHING")
+	numFields := 5
+	queryStr := "INSERT INTO books (title, price, rating, availability, image_url) VALUES "
+	vals := make([]interface{}, 0, len(batch)*numFields)
+	placeholders := make([]string, 0, len(batch))
+
+	for i, book := range batch {
+		offset := i * numFields
+		placeholders = append(placeholders, fmt.Sprintf("($%d, $%d, $%d, $%d, $%d)", offset+1, offset+2, offset+3, offset+4, offset+5))
+		vals = append(vals, book.Title, book.Price, book.Rating, book.Availability, book.ImageURL)
+	}
+
+	queryStr += strings.Join(placeholders, ", ")
+	queryStr += " ON CONFLICT (image_url) DO NOTHING;"
+
+	stmt, err := tx.PrepareContext(ctx, queryStr)
 	if err != nil {
-		slog.Error("Erro ao preparar statement para insercao", "erro", err)
+		slog.Error("falha ao preparar statement para insercao em lote", "erro", err)
 		return batch
 	}
 	defer stmt.Close()
 
-	var failedBooks []Book
-	for _, b := range batch {
-		if ctx.Err() != nil {
-			failedBooks = append(failedBooks, b)
-			continue
-		}
-
-		if _, err := stmt.ExecContext(ctx, b.Title, b.Price, b.Rating, b.Availability, b.ImageURL); err != nil {
-			slog.Error("Falha individual no banco. Destinando a DLQ.", "livro", b.Title, "erro", err)
-			failedBooks = append(failedBooks, b)
-		}
+	_, err = stmt.ExecContext(ctx, vals...)
+	if err != nil {
+		slog.Error("falha ao executar insercao em lote", "erro", err)
+		return batch
 	}
 
 	if err := tx.Commit(); err != nil {
-		slog.Error("Erro ao confirmar transacao em lote", "erro", err)
+		slog.Error("falha ao commitar transacao de lote", "erro", err)
 		return batch
 	}
-	return failedBooks
+
+	return nil
 }
 
 func startPipeline(ctx context.Context, db *sql.DB, csvWriter *csv.Writer, fileCSV *os.File, jsonFile *os.File) (chan<- Book, *sync.WaitGroup) {
@@ -212,6 +260,11 @@ func startPipeline(ctx context.Context, db *sql.DB, csvWriter *csv.Writer, fileC
 	wgDLQ.Add(1)
 	go func() {
 		defer wgDLQ.Done()
+
+		if err := os.MkdirAll("data", 0750); err != nil {
+			slog.Error("ERRO FATAL ao criar pasta data para a DLQ. Abortando execucao.", "erro", err)
+			os.Exit(1)
+		}
 
 		f, err := os.OpenFile("data/dlq.jsonl", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0640)
 		if err != nil {
