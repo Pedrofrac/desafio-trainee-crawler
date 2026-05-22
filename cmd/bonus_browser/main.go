@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -39,17 +38,17 @@ func main() {
 		}
 	}
 
-	targetURL, dnsRule, err := security.ValidateTargetURL(context.Background(), os.Getenv("BROWSER_TARGET_URL"))
+	targetURL, _, err := security.ValidateTargetURL(context.Background(), os.Getenv("BROWSER_TARGET_URL"))
 	if err != nil {
 		slog.Warn("URL de destino invalida ou nao segura. Fallback para site seguro executado.", "erro", err)
 		targetURL = "http://quotes.toscrape.com/js/"
-		dnsRule = "MAP quotes.toscrape.com 104.21.68.42"
+		// dnsRule = "MAP quotes.toscrape.com 104.21.68.42"
 	}
 
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.NoSandbox,
 		chromedp.Flag("disable-setuid-sandbox", true),
-		chromedp.Flag("host-resolver-rules", dnsRule), 
+		//chromedp.Flag("host-resolver-rules", dnsRule), 
 		chromedp.UserAgent("Scraper-Bot/9.0"), 
 	)
 	allocCtx, cancelAlloc := chromedp.NewExecAllocator(context.Background(), opts...)

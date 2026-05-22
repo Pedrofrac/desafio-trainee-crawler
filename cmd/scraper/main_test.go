@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings" // CORRIGIDO: Importação adicionada para evitar erro de compilação
 	"testing"
 	"context"
 
@@ -67,7 +68,6 @@ func TestStartPipelineWithMock(t *testing.T) {
 	}
 	defer db.Close()
 
-	// Configurado mock de bulk insert direto
 	mock.ExpectExec("INSERT INTO books").
 		WithArgs("Livro de Teste", 15.50, 4, "In stock", "http://imagem.com/teste.jpg").
 		WillReturnResult(sqlmock.NewResult(1, 1))
@@ -76,7 +76,7 @@ func TestStartPipelineWithMock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Erro ao criar CSV temporario: %s", err)
 	}
-	fJSON, err := os.CreateTemp("", "test_jsonl") // Atualizado para JSONL (.jsonl)
+	fJSON, err := os.CreateTemp("", "test_jsonl")
 	if err != nil {
 		t.Fatalf("Erro ao criar JSONL temporario: %s", err)
 	}

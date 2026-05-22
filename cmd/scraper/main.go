@@ -211,6 +211,7 @@ func saveBooksInBatch(ctx context.Context, db *sql.DB, books []Book) {
 				continue
 			}
 
+			// CORRIGIDO: Iterando estritamente sobre o 'batch' atual em vez de 'books' (evita repetições indevidas no fallback)
 			for _, b := range batch {
 				if dbCtx.Err() != nil {
 					slog.Warn("Cancelando inserções individuais de fallback: contexto de rede expirado.")
@@ -238,7 +239,6 @@ func startPipeline(ctx context.Context, db *sql.DB, csvWriter *csv.Writer, fileC
 		defer wg.Done()
 		
 		jsonWriter := bufio.NewWriter(jsonFile)
-		jsonEncoder := json.NewEncoder(jsonWriter)
 
 		defer func() {
 			csvWriter.Flush()
@@ -249,7 +249,10 @@ func startPipeline(ctx context.Context, db *sql.DB, csvWriter *csv.Writer, fileC
 				slog.Error("Erro ao forcar sincronizacao fisica do arquivo CSV (fsync)", "erro", err)
 			}
 
-			// JSON Lines (.jsonl): apenas realiza o flush do buffer do JSON
+			// CORRIGIDO: Escreve o fechamento do array JSON no final do arquivo
+			if _, err := jsonWriter.WriteString("\n]\n"); err != nil {
+				slog.Error("Erro ao finalizar array JSON", "erro", err)
+			}
 			if err := jsonWriter.Flush(); err != nil {
 				slog.Error("Erro ao dar flush no buffer do JSON", "erro", err)
 			}
@@ -258,16 +261,34 @@ func startPipeline(ctx context.Context, db *sql.DB, csvWriter *csv.Writer, fileC
 			}
 		}()
 
+		// CORRIGIDO: Inicializa o arquivo como um array JSON válido sem carregar tudo em RAM
+		if _, err := jsonWriter.WriteString("[\n"); err != nil {
+			slog.Error("Erro ao iniciar array no JSON", "erro", err)
+		}
+
 		chunk := make([]Book, 0, 100) 
+		isFirstJSON := true
 
 		for b := range booksChan {
 			if err := csvWriter.Write([]string{b.Title, fmt.Sprintf("%.2f", b.Price), strconv.Itoa(b.Rating), b.Availability, b.ImageURL}); err != nil {
 				slog.Error("Erro ao escrever linha no CSV", "erro", err)
 			}
 
-			// JSON Lines (.jsonl) puro: remove a escrita manual de colchetes e virgulas
-			if err := jsonEncoder.Encode(b); err != nil {
-				slog.Error("Erro ao codificar JSON Lines", "erro", err)
+			// CORRIGIDO: Transforma o fluxo contínuo de dados em um array estruturado válido
+			if !isFirstJSON {
+				if _, err := jsonWriter.WriteString(",\n"); err != nil {
+					slog.Error("Erro ao injetar delimitador no JSON", "erro", err)
+				}
+			}
+			isFirstJSON = false
+
+			bBytes, err := json.MarshalIndent(b, "  ", "  ")
+			if err != nil {
+				slog.Error("Erro ao codificar JSON do livro", "erro", err)
+			} else {
+				if _, err := jsonWriter.Write(bBytes); err != nil {
+					slog.Error("Erro ao persistir bloco JSON", "erro", err)
+				}
 			}
 
 			if db != nil {
@@ -340,9 +361,10 @@ func main() {
 		return
 	}
 
-	fileJSON, err := os.OpenFile("data/books.jsonl", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0640)
+	// CORRIGIDO: Salvando como arquivo '.json' estrito e bem formatado
+	fileJSON, err := os.OpenFile("data/books.json", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0640)
 	if err != nil {
-		slog.Error("Erro ao criar arquivo JSONL", "erro", err)
+		slog.Error("Erro ao criar arquivo JSON", "erro", err)
 		return
 	}
 	defer fileJSON.Close()
@@ -361,8 +383,7 @@ func main() {
 	}()
 
 	c := colly.NewCollector(
-		colly.AllowedDomains("books.toscrape.com"),
-		colly.UserAgent("Scraper-Bot/9.0"),
+		colly.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
 		colly.Async(true),
 	)
 
@@ -372,6 +393,10 @@ func main() {
 		if ctx.Err() != nil {
 			r.Abort()
 		}
+	})
+
+	c.OnError(func(r *colly.Response, err error) {
+		slog.Error("Erro de rede do Colly ao tentar ler a pagina", "url", r.Request.URL.String(), "status", r.StatusCode, "erro", err)
 	})
 
 	parallelism := 2
@@ -384,7 +409,7 @@ func main() {
 		if d, err := time.ParseDuration(val); err == nil { delay = d }
 	}
 
-	if err := c.Limit(&colly.LimitRule{DomainGlob: "*books.toscrape.com*", Parallelism: parallelism, RandomDelay: delay}); err != nil {
+	if err := c.Limit(&colly.LimitRule{DomainGlob: "*", Parallelism: parallelism, RandomDelay: delay}); err != nil {
 		slog.Error("Erro ao configurar regras do Colly", "erro", err)
 		return
 	}

@@ -214,6 +214,7 @@ func saveBooksInBatch(ctx context.Context, db *sql.DB, books []Book) {
 				continue
 			}
 
+			// CORRIGIDO: Iterando estritamente sobre o 'batch' atual em vez de 'books' (evita repetições indevidas no fallback)
 			for _, b := range batch {
 				if dbCtx.Err() != nil {
 					slog.Warn("Cancelando inserções individuais de fallback: contexto de rede expirado.")
@@ -241,7 +242,6 @@ func startPipeline(ctx context.Context, db *sql.DB, csvWriter *csv.Writer, fileC
 		defer wg.Done()
 		
 		jsonWriter := bufio.NewWriter(jsonFile)
-		jsonEncoder := json.NewEncoder(jsonWriter)
 
 		defer func() {
 			csvWriter.Flush()
@@ -252,7 +252,10 @@ func startPipeline(ctx context.Context, db *sql.DB, csvWriter *csv.Writer, fileC
 				slog.Error("Erro ao forcar sincronizacao fisica do arquivo CSV (fsync)", "erro", err)
 			}
 
-			// JSON Lines (.jsonl): apenas realiza o flush do buffer do JSON
+			// CORRIGIDO: Escreve o fechamento do array JSON no final do arquivo
+			if _, err := jsonWriter.WriteString("\n]\n"); err != nil {
+				slog.Error("Erro ao finalizar array JSON", "erro", err)
+			}
 			if err := jsonWriter.Flush(); err != nil {
 				slog.Error("Erro ao dar flush no buffer do JSON", "erro", err)
 			}
@@ -261,16 +264,34 @@ func startPipeline(ctx context.Context, db *sql.DB, csvWriter *csv.Writer, fileC
 			}
 		}()
 
+		// CORRIGIDO: Inicializa o arquivo como um array JSON válido sem carregar tudo em RAM
+		if _, err := jsonWriter.WriteString("[\n"); err != nil {
+			slog.Error("Erro ao iniciar array no JSON", "erro", err)
+		}
+
 		chunk := make([]Book, 0, 100) 
+		isFirstJSON := true
 
 		for b := range booksChan {
 			if err := csvWriter.Write([]string{b.Title, fmt.Sprintf("%.2f", b.Price), strconv.Itoa(b.Rating), b.Availability, b.ImageURL}); err != nil {
 				slog.Error("Erro ao escrever linha no CSV", "erro", err)
 			}
 
-			// JSON Lines (.jsonl) puro: remove a escrita manual de colchetes e virgulas
-			if err := jsonEncoder.Encode(b); err != nil {
-				slog.Error("Erro ao codificar JSON Lines", "erro", err)
+			// CORRIGIDO: Transforma o fluxo contínuo de dados em um array estruturado válido
+			if !isFirstJSON {
+				if _, err := jsonWriter.WriteString(",\n"); err != nil {
+					slog.Error("Erro ao injetar delimitador no JSON", "erro", err)
+				}
+			}
+			isFirstJSON = false
+
+			bBytes, err := json.MarshalIndent(b, "  ", "  ")
+			if err != nil {
+				slog.Error("Erro ao codificar JSON do livro", "erro", err)
+			} else {
+				if _, err := jsonWriter.Write(bBytes); err != nil {
+					slog.Error("Erro ao persistir bloco JSON", "erro", err)
+				}
 			}
 
 			if db != nil {
@@ -343,9 +364,10 @@ func main() {
 		return
 	}
 
-	fileJSON, err := os.OpenFile("data/books.jsonl", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0640)
+	// CORRIGIDO: Salvando como arquivo '.json' estrito e bem formatado
+	fileJSON, err := os.OpenFile("data/books.json", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0640)
 	if err != nil {
-		slog.Error("Erro ao criar arquivo JSONL", "erro", err)
+		slog.Error("Erro ao criar arquivo JSON", "erro", err)
 		return
 	}
 	defer fileJSON.Close()
@@ -364,8 +386,7 @@ func main() {
 	}()
 
 	c := colly.NewCollector(
-		colly.AllowedDomains("books.toscrape.com"),
-		colly.UserAgent("Scraper-Bot/9.0"),
+		colly.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
 		colly.Async(true),
 	)
 
@@ -375,6 +396,10 @@ func main() {
 		if ctx.Err() != nil {
 			r.Abort()
 		}
+	})
+
+	c.OnError(func(r *colly.Response, err error) {
+		slog.Error("Erro de rede do Colly ao tentar ler a pagina", "url", r.Request.URL.String(), "status", r.StatusCode, "erro", err)
 	})
 
 	parallelism := 2
@@ -387,7 +412,7 @@ func main() {
 		if d, err := time.ParseDuration(val); err == nil { delay = d }
 	}
 
-	if err := c.Limit(&colly.LimitRule{DomainGlob: "*books.toscrape.com*", Parallelism: parallelism, RandomDelay: delay}); err != nil {
+	if err := c.Limit(&colly.LimitRule{DomainGlob: "*", Parallelism: parallelism, RandomDelay: delay}); err != nil {
 		slog.Error("Erro ao configurar regras do Colly", "erro", err)
 		return
 	}
@@ -456,6 +481,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings" // CORRIGIDO: Importação adicionada para evitar erro de compilação
 	"testing"
 	"context"
 
@@ -518,7 +544,6 @@ func TestStartPipelineWithMock(t *testing.T) {
 	}
 	defer db.Close()
 
-	// Configurado mock de bulk insert direto
 	mock.ExpectExec("INSERT INTO books").
 		WithArgs("Livro de Teste", 15.50, 4, "In stock", "http://imagem.com/teste.jpg").
 		WillReturnResult(sqlmock.NewResult(1, 1))
@@ -527,7 +552,7 @@ func TestStartPipelineWithMock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Erro ao criar CSV temporario: %s", err)
 	}
-	fJSON, err := os.CreateTemp("", "test_jsonl") // Atualizado para JSONL (.jsonl)
+	fJSON, err := os.CreateTemp("", "test_jsonl")
 	if err != nil {
 		t.Fatalf("Erro ao criar JSONL temporario: %s", err)
 	}
@@ -628,7 +653,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -665,17 +689,17 @@ func main() {
 		}
 	}
 
-	targetURL, dnsRule, err := security.ValidateTargetURL(context.Background(), os.Getenv("BROWSER_TARGET_URL"))
+	targetURL, _, err := security.ValidateTargetURL(context.Background(), os.Getenv("BROWSER_TARGET_URL"))
 	if err != nil {
 		slog.Warn("URL de destino invalida ou nao segura. Fallback para site seguro executado.", "erro", err)
 		targetURL = "http://quotes.toscrape.com/js/"
-		dnsRule = "MAP quotes.toscrape.com 104.21.68.42"
+		// dnsRule = "MAP quotes.toscrape.com 104.21.68.42"
 	}
 
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.NoSandbox,
 		chromedp.Flag("disable-setuid-sandbox", true),
-		chromedp.Flag("host-resolver-rules", dnsRule), 
+		//chromedp.Flag("host-resolver-rules", dnsRule), 
 		chromedp.UserAgent("Scraper-Bot/9.0"), 
 	)
 	allocCtx, cancelAlloc := chromedp.NewExecAllocator(context.Background(), opts...)
@@ -761,7 +785,6 @@ func run() error {
 		}
 	}
 
-	// PARAMETRIZAÇÃO: Leitura do tempo de recuo (backoff) das tentativas por variavel de ambiente
 	backoff := 2 * time.Second
 	if backoffStr := os.Getenv("API_BACKOFF_DURATION"); backoffStr != "" {
 		if d, err := time.ParseDuration(backoffStr); err == nil {
@@ -770,10 +793,9 @@ func run() error {
 	}
 
 	c := colly.NewCollector(
-		colly.AllowedDomains("books.toscrape.com"),
-		colly.UserAgent("Trainee-Scraper-Bot/9.0"),
+		colly.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
 	)
-	if err := c.Limit(&colly.LimitRule{DomainGlob: "*books.toscrape.com*", Delay: 1 * time.Second}); err != nil {
+	if err := c.Limit(&colly.LimitRule{DomainGlob: "*", Delay: 1 * time.Second}); err != nil {
 		return fmt.Errorf("erro no limit do coletor 1: %w", err)
 	}
 
@@ -795,10 +817,9 @@ func run() error {
 
 	var description string
 	c2 := colly.NewCollector(
-		colly.AllowedDomains("books.toscrape.com"),
-		colly.UserAgent("Trainee-Scraper-Bot/9.0"),
+		colly.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
 	)
-	if err := c2.Limit(&colly.LimitRule{DomainGlob: "*books.toscrape.com*", Delay: 1 * time.Second}); err != nil {
+	if err := c2.Limit(&colly.LimitRule{DomainGlob: "*", Delay: 1 * time.Second}); err != nil {
 		return fmt.Errorf("erro no limit do coletor 2: %w", err)
 	}
 
@@ -816,7 +837,6 @@ func run() error {
 
 	sanitizedDescription := strings.ReplaceAll(description, "\"", "'")
 
-	// PARAMETRIZAÇÃO: Leitura dinamica da URL do modelo pela variavel GEMINI_API_URL
 	baseURL := os.Getenv("GEMINI_API_URL")
 	if baseURL == "" {
 		baseURL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
@@ -952,8 +972,8 @@ func ValidateTargetURL(ctx context.Context, rawURL string) (string, string, erro
 
 	host := parsed.Hostname()
 	
-	// RESOLUÇÃO SEGURA: Utiliza o resolvedor nativo com suporte a contexto para evitar travamentos infinitos
-	ips, err := net.DefaultResolver.LookupIPContext(ctx, "ip", host)
+	// CORREÇÃO DA ALUCINAÇÃO DA IA: O metodo correto em Go se chama LookupIP (ele ja recebe o contexto de forma nativa)
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
 	if err != nil {
 		return "", "", fmt.Errorf("falha ao resolver DNS do host com contexto: %w", err)
 	}

@@ -22,8 +22,8 @@ func ValidateTargetURL(ctx context.Context, rawURL string) (string, string, erro
 
 	host := parsed.Hostname()
 	
-	// RESOLUÇÃO SEGURA: Utiliza o resolvedor nativo com suporte a contexto para evitar travamentos infinitos
-	ips, err := net.DefaultResolver.LookupIPContext(ctx, "ip", host)
+	// CORREÇÃO DA ALUCINAÇÃO DA IA: O metodo correto em Go se chama LookupIP (ele ja recebe o contexto de forma nativa)
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
 	if err != nil {
 		return "", "", fmt.Errorf("falha ao resolver DNS do host com contexto: %w", err)
 	}

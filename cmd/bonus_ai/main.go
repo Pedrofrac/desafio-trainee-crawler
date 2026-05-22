@@ -53,7 +53,6 @@ func run() error {
 		}
 	}
 
-	// PARAMETRIZAÇÃO: Leitura do tempo de recuo (backoff) das tentativas por variavel de ambiente
 	backoff := 2 * time.Second
 	if backoffStr := os.Getenv("API_BACKOFF_DURATION"); backoffStr != "" {
 		if d, err := time.ParseDuration(backoffStr); err == nil {
@@ -62,10 +61,9 @@ func run() error {
 	}
 
 	c := colly.NewCollector(
-		colly.AllowedDomains("books.toscrape.com"),
-		colly.UserAgent("Trainee-Scraper-Bot/9.0"),
+		colly.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
 	)
-	if err := c.Limit(&colly.LimitRule{DomainGlob: "*books.toscrape.com*", Delay: 1 * time.Second}); err != nil {
+	if err := c.Limit(&colly.LimitRule{DomainGlob: "*", Delay: 1 * time.Second}); err != nil {
 		return fmt.Errorf("erro no limit do coletor 1: %w", err)
 	}
 
@@ -87,10 +85,9 @@ func run() error {
 
 	var description string
 	c2 := colly.NewCollector(
-		colly.AllowedDomains("books.toscrape.com"),
-		colly.UserAgent("Trainee-Scraper-Bot/9.0"),
+		colly.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
 	)
-	if err := c2.Limit(&colly.LimitRule{DomainGlob: "*books.toscrape.com*", Delay: 1 * time.Second}); err != nil {
+	if err := c2.Limit(&colly.LimitRule{DomainGlob: "*", Delay: 1 * time.Second}); err != nil {
 		return fmt.Errorf("erro no limit do coletor 2: %w", err)
 	}
 
@@ -108,7 +105,6 @@ func run() error {
 
 	sanitizedDescription := strings.ReplaceAll(description, "\"", "'")
 
-	// PARAMETRIZAÇÃO: Leitura dinamica da URL do modelo pela variavel GEMINI_API_URL
 	baseURL := os.Getenv("GEMINI_API_URL")
 	if baseURL == "" {
 		baseURL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
