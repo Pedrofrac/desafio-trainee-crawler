@@ -20,12 +20,52 @@ import (
 
 type ExtractedData map[string]any
 
-func cleanMarkdownJSON(jsonText string) string {
+func cleanJSONFallback(jsonText string) string {
+	// 1. Tenta extrair primeiro do bloco Markdown (caso a IA use formatação)
 	re := regexp.MustCompile(`(?s)\x60\x60\x60(?:json)?(.*?)\x60\x60\x60`)
 	if match := re.FindStringSubmatch(jsonText); len(match) > 1 {
-		jsonText = match[1]
+		return strings.TrimSpace(match[1])
 	}
-	return strings.TrimSpace(jsonText)
+
+	// 2. Analisador Lexico Ciente de Contexto de Strings (Ignora chaves literais como "Livros de {programacao}")
+	start := strings.Index(jsonText, "{")
+	if start == -1 {
+		return ""
+	}
+
+	braceCount := 0
+	inString := false
+	escaped := false
+
+	for i := start; i < len(jsonText); i++ {
+		char := jsonText[i]
+
+		if inString {
+			if escaped {
+				escaped = false
+			} else if char == '\\' {
+				escaped = true
+			} else if char == '"' {
+				inString = false
+			}
+			// Qualquer caractere de chave { ou } dentro de uma string literal de JSON é ignorado
+			continue
+		}
+
+		if char == '"' {
+			inString = true
+			escaped = false
+		} else if char == '{' {
+			braceCount++
+		} else if char == '}' {
+			braceCount--
+			if braceCount == 0 {
+				return strings.TrimSpace(jsonText[start : i+1])
+			}
+		}
+	}
+
+	return ""
 }
 
 func main() {
@@ -33,9 +73,17 @@ func main() {
 	slog.SetDefault(logger)
 
 	if err := run(); err != nil {
-		slog.Error("Falha critica na execucao da IA", "erro", err)
-		os.Exit(1) 
+		slog.Warn("Falha na execucao da IA para este item. Pulando e continuando pipeline...", "erro", err)
 	}
+}
+
+var globalHttpClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+	},
 }
 
 func run() error {
@@ -117,7 +165,7 @@ func run() error {
 	query.Set("key", apiKey)
 	parsedURL.RawQuery = query.Encode()
 
-	prompt := fmt.Sprintf(`Leia a seguinte sinopse de livro e extraia o Assunto Principal e o Sentimento em formato JSON {"assunto": "", "sentimento": ""}. Texto: "%s"`, sanitizedDescription)
+	prompt := fmt.Sprintf(`Leia a seguinte sinopse de livro e extraia o Assunto Principal e o Sentimento em formato JSON {"assunto": "", "sentimento": ""}. RETORNE EXATAMENTE E APENAS O JSON PURO. NÃO USE BLOCOS DE CÓDIGO MARKDOWN (\x60\x60\x60json). Texto: "%s"`, sanitizedDescription)
 	
 	reqBodyMap := map[string]interface{}{
 		"contents": []map[string]interface{}{{"parts": []map[string]interface{}{{"text": prompt}}}},
@@ -132,14 +180,7 @@ func run() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	httpClient := &http.Client{
-		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     90 * time.Second,
-		},
-	}
+	
 
 	var resp *http.Response
 	var respErr error
@@ -152,7 +193,7 @@ func run() error {
 		}
 		req.Header.Set("Content-Type", "application/json")
 
-		resp, respErr = httpClient.Do(req)
+		resp, respErr = globalHttpClient.Do(req)
 		if respErr == nil && resp.StatusCode == http.StatusOK {
 			break
 		}
@@ -205,12 +246,19 @@ func run() error {
 		return fmt.Errorf("Gemini retornou uma estrutura de resposta vazia")
 	}
 
-	jsonText := cleanMarkdownJSON(geminiResp.Candidates[0].Content.Parts[0].Text)
+	rawText := geminiResp.Candidates[0].Content.Parts[0].Text
 
 	var extractedData ExtractedData
-	if err := json.Unmarshal([]byte(jsonText), &extractedData); err != nil {
-		return fmt.Errorf("falha critica ao converter JSON limpo da IA: %w", err)
+	// Tenta fazer o parse nativo direto, confiando na eficácia do novo Prompt
+	if err := json.Unmarshal([]byte(rawText), &extractedData); err != nil {
+		// Fallback programático acionado apenas se a IA desobedecer e injetar texto livre/markdown
+		cleanedText := cleanJSONFallback(rawText)
+		if errRetry := json.Unmarshal([]byte(cleanedText), &extractedData); errRetry != nil {
+			slog.Warn("Falha irrecuperavel de parse no LLM, pulando item", "erro", errRetry, "payload", rawText)
+			return nil
+		}
 	}
+	jsonText := rawText // para log final
 
 	slog.Info("Dados de NLP processados com sucesso pela IA", "json", jsonText)
 	return nil

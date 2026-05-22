@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	_ "github.com/lib/pq"
 	"context"
 	"database/sql"
@@ -30,7 +32,7 @@ type Book struct {
 }
 
 var (
-		ratingsMap = map[string]int{
+	ratingsMap = map[string]int{
 		"one":   1,
 		"two":   2,
 		"three": 3,
@@ -40,13 +42,12 @@ var (
 )
 
 func cleanPrice(priceStr string) (float64, error) {
-	// Remover espacos iniciais/finais redundantes
 	trimmed := strings.TrimSpace(priceStr)
 	if trimmed == "" {
 		return 0.0, fmt.Errorf("string de preco vazia")
 	}
 
-	// Filtrar apenas caracteres numericos, ponto e virgula
+	// Filtrar apenas dígitos, pontos e vírgulas
 	var sb strings.Builder
 	for _, r := range trimmed {
 		if (r >= '0' && r <= '9') || r == '.' || r == ',' {
@@ -54,68 +55,47 @@ func cleanPrice(priceStr string) (float64, error) {
 		}
 	}
 	cleaned := sb.String()
-	if len(cleaned) == 0 {
+	if cleaned == "" {
 		return 0.0, fmt.Errorf("nenhum caractere numerico ou separador encontrado em %q", priceStr)
 	}
 
-	// Localizar o indice do ultimo caractere nao alfanumerico (ponto ou virgula)
-	lastIdx := -1
-	for i := len(cleaned) - 1; i >= 0; i-- {
-		if cleaned[i] == '.' || cleaned[i] == ',' {
-			lastIdx = i
-			break
+	lastDot := strings.LastIndex(cleaned, ".")
+	lastComma := strings.LastIndex(cleaned, ",")
+
+	lastSepIdx := -1
+
+	if lastDot != -1 && lastComma != -1 {
+		// Caso possua ambos os separadores, o último na string é obrigatoriamente o decimal
+		if lastDot > lastComma {
+			lastSepIdx = lastDot
+		} else {
+			lastSepIdx = lastComma
+		}
+	} else if lastDot != -1 {
+		// Possui apenas o ponto decimal. Se seguido de exatamente 3 dígitos, assume-se milhar.
+		afterDot := len(cleaned) - 1 - lastDot
+		if afterDot != 3 {
+			lastSepIdx = lastDot
+		}
+	} else if lastComma != -1 {
+		// Possui apenas a vírgula. Se seguida de exatamente 3 dígitos, assume-se milhar.
+		afterComma := len(cleaned) - 1 - lastComma
+		if afterComma != 3 {
+			lastSepIdx = lastComma
 		}
 	}
 
-	var integerPart, decimalPart string
-	if lastIdx != -1 {
-		// Parte inteira e tudo a esquerda do ultimo separador
-		left := cleaned[:lastIdx]
-		// Parte decimal e tudo a direita do ultimo separador
-		right := cleaned[lastIdx+1:]
-
-		// Limpar a parte inteira de outros separadores (milhar) mantendo apenas digitos
-		var intSb strings.Builder
-		for _, r := range left {
-			if r >= '0' && r <= '9' {
-				intSb.WriteRune(r)
-			}
+	// Normalização para o padrão float do Go (apenas dígitos e opcionalmente um único ponto decimal)
+	var finalSb strings.Builder
+	for i, r := range cleaned {
+		if r >= '0' && r <= '9' {
+			finalSb.WriteRune(r)
+		} else if i == lastSepIdx {
+			finalSb.WriteRune('.')
 		}
-		integerPart = intSb.String()
-
-		// Limpar a parte decimal para conter apenas digitos
-		var decSb strings.Builder
-		for _, r := range right {
-			if r >= '0' && r <= '9' {
-				decSb.WriteRune(r)
-			}
-		}
-		decimalPart = decSb.String()
-	} else {
-		// Sem separador decimal explicito, trata a string inteira limpa como inteiro
-		var intSb strings.Builder
-		for _, r := range cleaned {
-			if r >= '0' && r <= '9' {
-				intSb.WriteRune(r)
-			}
-		}
-		integerPart = intSb.String()
 	}
 
-	// Validacao final da reconstrucao numerica
-	if integerPart == "" && decimalPart == "" {
-		return 0.0, fmt.Errorf("falha ao sanitizar partes inteira e decimal de %q", priceStr)
-	}
-
-	if integerPart == "" {
-		integerPart = "0"
-	}
-
-	finalStr := integerPart
-	if decimalPart != "" {
-		finalStr += "." + decimalPart
-	}
-
+	finalStr := finalSb.String()
 	val, err := strconv.ParseFloat(finalStr, 64)
 	if err != nil {
 		return 0.0, fmt.Errorf("falha ao converter valor formatado %q em float64: %w", finalStr, err)
@@ -156,18 +136,19 @@ func runMigrations(ctx context.Context, db *sql.DB) error {
 
 func setupDatabase(ctx context.Context) (*sql.DB, error) {
 	dbHost := os.Getenv("DB_HOST")
-	if dbHost == "" { dbHost = "localhost" }
 	dbPort := os.Getenv("DB_PORT")
-	if dbPort == "" { dbPort = "5432" }
 	dbSSLMode := os.Getenv("DB_SSLMODE")
-	if dbSSLMode == "" { dbSSLMode = "disable" }
-
 	dbUser := os.Getenv("POSTGRES_USER")
 	dbPass := os.Getenv("POSTGRES_PASSWORD")
 	dbName := os.Getenv("POSTGRES_DB")
 
-	if dbUser == "" || dbPass == "" || dbName == "" {
-		return nil, fmt.Errorf("credenciais de banco de dados ausentes no ambiente")
+	// Fail Fast: Obriga a injeção da infraestrutura via ambiente
+	if dbHost == "" || dbPort == "" || dbUser == "" || dbPass == "" || dbName == "" {
+		return nil, fmt.Errorf("variaveis de conexao ausentes (DB_HOST, DB_PORT, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB sao obrigatorias)")
+	}
+	
+	if dbSSLMode == "" {
+		dbSSLMode = "disable" // Permitido apenas para desenvolvimento local
 	}
 
 	u := &url.URL{
@@ -254,6 +235,7 @@ func saveBooksInBatch(ctx context.Context, db *sql.DB, batch []Book) []Book {
 func startPipeline(ctx context.Context, db *sql.DB, csvWriter *csv.Writer, fileCSV *os.File, jsonFile *os.File) (chan<- Book, *sync.WaitGroup) {
 	booksChan := make(chan Book, 100)
 	dlqChan := make(chan Book, 1000)
+	dbChan := make(chan Book, 1000) // Canal bufferizado isolado para o banco de dados
 	var wg sync.WaitGroup
 
 	var wgDLQ sync.WaitGroup
@@ -262,13 +244,13 @@ func startPipeline(ctx context.Context, db *sql.DB, csvWriter *csv.Writer, fileC
 		defer wgDLQ.Done()
 
 		if err := os.MkdirAll("data", 0750); err != nil {
-			slog.Error("ERRO FATAL ao criar pasta data para a DLQ. Abortando execucao.", "erro", err)
+			slog.Error("ERRO FATAL ao criar pasta data para a DLQ", "erro", err)
 			os.Exit(1)
 		}
 
 		f, err := os.OpenFile("data/dlq.jsonl", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0640)
 		if err != nil {
-			slog.Error("ERRO FATAL ao abrir arquivo DLQ. Abortando processo de execucao para evitar perda de dados.", "erro", err)
+			slog.Error("ERRO FATAL ao abrir arquivo DLQ", "erro", err)
 			os.Exit(1)
 		}
 		defer f.Close()
@@ -279,96 +261,113 @@ func startPipeline(ctx context.Context, db *sql.DB, csvWriter *csv.Writer, fileC
 				slog.Error("Erro ao gravar livro na DLQ", "erro", err, "livro", b.Title)
 			}
 		}
-		if err := f.Sync(); err != nil {
-			slog.Error("Erro ao aplicar fsync na DLQ", "erro", err)
-		}
+		f.Sync()
 	}()
 
+	var wgDBWorker sync.WaitGroup
+	var wgDB sync.WaitGroup
+	semDB := make(chan struct{}, 5)
+
+	// Goroutine consumidora do Banco de Dados - Roda totalmente isolada do I/O de disco
+	if db != nil {
+		wgDBWorker.Add(1)
+		go func() {
+			defer wgDBWorker.Done()
+
+			chunk := make([]Book, 0, 100)
+			flushChunk := func() {
+				if len(chunk) == 0 {
+					return
+				}
+				batch := make([]Book, len(chunk))
+				copy(batch, chunk)
+				chunk = chunk[:0]
+
+				semDB <- struct{}{}
+				wgDB.Add(1)
+				go func(data []Book) {
+					defer wgDB.Done()
+					defer func() { <-semDB }()
+
+					flushCtx, flushCancel := context.WithTimeout(context.Background(), 15*time.Second)
+					failed := saveBooksInBatch(flushCtx, db, data)
+					flushCancel()
+
+					for _, fb := range failed {
+						select {
+						case dlqChan <- fb:
+						default:
+							slog.Error("CRITICO: Canal DLQ cheio, descartando livro", "livro", fb.Title)
+						}
+					}
+				}(batch)
+			}
+
+			for b := range dbChan {
+				chunk = append(chunk, b)
+				if len(chunk) >= 100 {
+					flushChunk()
+				}
+			}
+			flushChunk() // Flush dos elementos remanescentes
+		}()
+	}
+
+	// Goroutine consumidora principal (I/O de Disco Plano - Sem bloqueios de Rede/Banco)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 
 		jsonEncoder := json.NewEncoder(jsonFile)
 
-		var wgDB sync.WaitGroup
-		semDB := make(chan struct{}, 5) // Semáforo limitador para mitigar Memory Leak de Goroutines
-
 		defer func() {
-			wgDB.Wait()
-			close(dlqChan)
-			wgDLQ.Wait()
-
-			if err := jsonFile.Sync(); err != nil {
-				slog.Error("Erro ao forcar sincronizacao fisica do arquivo JSON", "erro", err)
-			}
+			close(dbChan)     // Notifica o dreno do banco de dados
+			wgDBWorker.Wait() // Aguarda o dreno terminar
+			wgDB.Wait()       // Aguarda transações em andamento
+			close(dlqChan)    // Fecha a DLQ com segurança de concorrência
+			wgDLQ.Wait()      // Garante escrita do arquivo da DLQ
 
 			csvWriter.Flush()
 			if err := csvWriter.Error(); err != nil {
 				slog.Error("Erro de gravacao pendente no CSV", "erro", err)
 			}
 			if err := fileCSV.Sync(); err != nil {
-				slog.Error("Erro ao forcar sincronizacao fisica do arquivo CSV", "erro", err)
+				slog.Error("Erro ao sincronizar fisicamente arquivo CSV no disco", "erro", err)
+			}
+			if err := jsonFile.Sync(); err != nil {
+				slog.Error("Erro ao sincronizar fisicamente arquivo JSONL no disco", "erro", err)
 			}
 		}()
 
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 
-		chunk := make([]Book, 0, 100)
-
 		for {
 			select {
 			case b, ok := <-booksChan:
 				if !ok {
-					if db != nil && len(chunk) > 0 {
-						batch := make([]Book, len(chunk))
-						copy(batch, chunk)
-
-						semDB <- struct{}{}
-						wgDB.Add(1)
-						go func(data []Book) {
-							defer wgDB.Done()
-							flushCtx, flushCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-							failed := saveBooksInBatch(flushCtx, db, data)
-							flushCancel()
-							<-semDB // Liberado ANTES da DLQ para prevenir Deadlock lógico
-
-							for _, fb := range failed {
-								dlqChan <- fb
-							}
-						}(batch)
-					}
 					return
 				}
 
+				// Escrita local e veloz nos arquivos planos de fallback com tratamento rigoroso de erros de I/O
 				if err := csvWriter.Write([]string{b.Title, fmt.Sprintf("%.2f", b.Price), strconv.Itoa(b.Rating), b.Availability, b.ImageURL}); err != nil {
-					slog.Error("Erro ao escrever linha no CSV", "erro", err)
+					slog.Error("Falha critica de gravacao no arquivo CSV (possivel exaustao de disco)", "erro", err, "livro", b.Title)
 				}
-
 				if err := jsonEncoder.Encode(b); err != nil {
-					slog.Error("Erro ao persistir bloco JSONL", "erro", err)
+					slog.Error("Falha critica de gravacao no arquivo JSONL (possivel exaustao de disco)", "erro", err, "livro", b.Title)
 				}
 
 				if db != nil {
-					chunk = append(chunk, b)
-					if len(chunk) >= 100 {
-						batch := make([]Book, len(chunk))
-						copy(batch, chunk)
-						chunk = chunk[:0]
-
-						semDB <- struct{}{}
-						wgDB.Add(1)
-						go func(data []Book) {
-							defer wgDB.Done()
-							flushCtx, flushCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-							failed := saveBooksInBatch(flushCtx, db, data)
-							flushCancel()
-							<-semDB // Liberado ANTES da DLQ
-
-							for _, fb := range failed {
-								dlqChan <- fb
-							}
-						}(batch)
+					select {
+					case dbChan <- b:
+					default:
+						// Banco lento ou saturado: Desvia não-bloqueante para a DLQ preservando o fluxo
+						slog.Warn("Pipeline de banco de dados saturada. Desviando para DLQ de seguranca.", "livro", b.Title)
+						select {
+						case dlqChan <- b:
+						default:
+							slog.Error("CRITICO: Fila DLQ saturada. Registro descartado.", "livro", b.Title)
+						}
 					}
 				}
 
@@ -402,8 +401,11 @@ func main() {
 		IdleTimeout:  30 * time.Second,
 	}
 
+		var srvWg sync.WaitGroup
+	srvWg.Add(1)
 	errChan := make(chan error, 1)
 	go func() {
+		defer srvWg.Done()
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("Erro FATAL no servidor de Health Check", "erro", err)
 			errChan <- err
@@ -488,7 +490,7 @@ func main() {
 		}
 	}
 
-	if err := c.Limit(&colly.LimitRule{DomainGlob: "*", Parallelism: parallelism, RandomDelay: delay}); err != nil {
+	if err := c.Limit(&colly.LimitRule{DomainGlob: "*", Parallelism: parallelism, Delay: delay, RandomDelay: delay / 2}); err != nil {
 		slog.Error("Erro ao configurar regras do Colly", "erro", err)
 		return
 	}
@@ -508,7 +510,8 @@ func main() {
 		imgURL := e.Request.AbsoluteURL(e.ChildAttr(".image_container img", "src"))
 		// Restabelece a idempotência real substituindo URLs vazias por chaves geradas em hash
 		if imgURL == "" || strings.HasSuffix(imgURL, "/") {
-			imgURL = "no-image-url:title:" + url.PathEscape(title)
+			hash := sha256.Sum256([]byte(title))
+			imgURL = "hash://no-image/" + hex.EncodeToString(hash[:])
 		}
 
 		book := Book{
@@ -535,21 +538,24 @@ func main() {
 		}
 	})
 
-	slog.Info("Iniciando varredura...")
-	if err := c.Visit("https://books.toscrape.com/catalogue/page-1.html"); err != nil {
-		slog.Error("Erro fatal ao acessar o site", "erro", err)
-		return
-	}
+		slog.Info("Iniciando varredura...")
 
-	go func() {
+	// Garante o fechamento seguro em cascata: Colly -> Canais -> Pipeline -> DB -> HTTP Server
+	defer func() {
 		c.Wait()
 		close(booksChan)
-	}()
-	wg.Wait()
+		wg.Wait() // Aguarda o encerramento completo do processamento de arquivos e banco de dados
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer shutdownCancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		slog.Error("Erro ao desligar servidor de Health Check", "erro", err)
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			slog.Error("Erro ao desligar servidor de Health Check", "erro", err)
+		}
+		srvWg.Wait() // Garante que a goroutine do servidor HTTP finalizou com sucesso
+		slog.Info("Graceful Shutdown concluido com sucesso.")
+	}()
+
+	if err := c.Visit("https://books.toscrape.com/catalogue/page-1.html"); err != nil {
+		slog.Error("Erro fatal ao acessar o site", "erro", err)
 	}
 }

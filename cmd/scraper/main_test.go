@@ -22,8 +22,12 @@ func TestCleanPrice(t *testing.T) {
 		expected float64
 		hasError bool
 	}{
-		{"Preço normal", "£12.99", 12.99, false},
-		{"Preço com milhares", "£1,000.50", 1000.50, false},
+		{"Preço normal UK/US", "£12.99", 12.99, false},
+		{"Preço com milhares UK/US", "£1,000.50", 1000.50, false},
+		{"Preço com milhares exato UK/US", "£1,000", 1000.0, false},
+		{"Preço Euro com virgula", "12,99 €", 12.99, false},
+		{"Preço Real com milhares e virgula", "R$ 1.250,50", 1250.50, false},
+		{"Preço Real milhar exato", "1.250", 1250.0, false},
 		{"Preço com bug de encoding", "Â£45.17", 45.17, false},
 		{"String vazia", "", 0.0, true},
 		{"Texto invalido", "grátis", 0.0, true},
