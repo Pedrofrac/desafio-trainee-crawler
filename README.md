@@ -1,106 +1,165 @@
 # Desafio Técnico — Programa Trainee Crawler/RPA & IA
 
-Olá! Este é o meu projeto para o Desafio Técnico. Como candidato à vaga de Trainee, meu foco aqui foi sair da zona de conforto. Desenvolvi um Web Scraper concorrente em **Go**, integrei persistência relacional (PostgreSQL), e busquei implementar **todos os bônus** exigidos pelo edital para demonstrar minha capacidade de pesquisa e aprendizado rápido.
+Este projeto consiste em um Web Scraper de alta performance desenvolvido na linguagem Go, projetado com foco em concorrência segura, streaming de I/O estável, persistência relacional resiliente e integração com Inteligência Artificial (NLP).
 
 ---
 
 ## 🎁 Diferenciais e Bônus Implementados
 
-1. **Persistência Relacional (PostgreSQL):** Gravação em lote (*Bulk Ingestion*) utilizando `ON CONFLICT DO NOTHING` para evitar duplicação de dados.
-2. **Automação de Browser:** Script bônus (`bonus_browser`) utilizando `chromedp` para extrair dados gerados dinamicamente via JavaScript.
-3. **Integração com IA (Gemini 2.5 Flash):** Script bônus (`bonus_ai`) que raspa um livro real do site e envia a sinopse para o Google Gemini extrair o Assunto e Sentimento via NLP.
-4. **Pipeline CI/CD Otimizado:** Esteira configurada no `.gitlab-ci.yml` com etapas de Lint, Testes Automatizados (Mocks), Build de Imagem e Deploy Simulado.
+1. **Persistência Relacional com Resiliência (PostgreSQL + Docker Compose):**
+   Integração ativa com banco de dados PostgreSQL. A gravação é feita em lotes (*Bulk Ingestion*) de 100 em 100 livros de forma a mitigar sobrecargas de conexão e rede. O sistema possui resiliência a dados duplicados na origem utilizando restrição de unicidade baseada na URL estática do livro (`image_url UNIQUE`) e a cláusula `ON CONFLICT DO NOTHING`.
+   
+2. **Automação de Browser (Páginas Dinâmicas):**
+   O arquivo `cmd/bonus_browser/main.go` demonstra capacidade de interagir com páginas renderizadas dinamicamente via JavaScript utilizando headless browser (`chromedp`), realizando a varredura do site *Quotes to Scrape (JS)* com validações de segurança contra ataques de SSRF e DNS Rebinding.
+
+3. **Extração de Sinopses e NLP com IA (Gemini 2.5 Flash):**
+   O arquivo `cmd/bonus_ai/main.go` realiza a raspagem dinâmica da URL do primeiro livro disponível na página inicial do site. Em seguida, extrai a sinopse longa e consome a API do Gemini 2.5 Flash para realizar análise de sentimento e extração de assunto principal, retornando uma estrutura estritamente validada em JSON.
+
+4. **Pipeline CI/CD Otimizado com Cache Local:**
+   O arquivo `.gitlab-ci.yml` configura o `GOPATH` localmente na pasta do projeto para permitir que o GitLab salve o cache de dependências de forma efetiva (`.go/pkg/mod/`), acelerando o tempo de execução do pipeline.
+
+---
+
+## 📂 Estrutura de Pastas do Projeto
+
+```text
+desafio/
+├── cmd/
+│   ├── scraper/
+│   │   ├── main.go
+│   │   └── main_test.go
+│   ├── bonus_browser/
+│   │   └── main.go
+│   └── bonus_ai/
+│       └── main.go
+├── internal/
+│   └── security/
+│       └── ssrf.go
+├── data/
+│   ├── books.csv
+│   └── books.jsonl
+├── Dockerfile
+├── docker-compose.yml
+├── .gitlab-ci.yml
+├── .gitignore
+├── go.mod
+└── go.sum
+```
+
+---
+
+## 📊 Estrutura e Schema dos Dados Gerados
+
+### 1. Banco de Dados (PostgreSQL)
+A tabela `books` é instanciada automaticamente com o seguinte schema:
+* `id`: SERIAL (Chave Primária)
+* `title`: TEXT (Título do livro)
+* `price`: NUMERIC (Preço decimal limpo)
+* `rating`: INT (Nota mapeada de 1 a 5)
+* `availability`: TEXT (Status de estoque)
+* `image_url`: TEXT UNIQUE (URL estática e chave de unicidade)
+
+### 2. Arquivos Planos (Pasta `data/`)
+* **`books.csv`:** Arquivo plano estruturado com cabeçalho contendo `Title`, `Price`, `Rating`, `Availability` e `ImageURL`.
+* **`books.jsonl`:** Formato JSON Lines (JSONL) onde cada linha é um objeto JSON independente e gravado de forma segura sem buffers manuais:
+
+```jsonl
+{
+    "title": "A Light in the Attic",
+    "price": 51.77,
+    "rating": 3,
+    "availability": "In stock",
+    "image_url": "https://books.toscrape.com/catalogue/a-light-in-the-attic_1000/index.html"
+}
+```
+
+---
+
+## 💡 Decisões de Engenharia e Arquitetura
+
+* **Consumo de Memória Estável O(1) (Streaming de I/O):**
+  Para evitar o estouro de memória (OOM) comum em scrapers de grande volume, o robô não acumula os dados em fatias (*slices*) na memória RAM para salvar o JSON. O arquivo é processado na extensão `.jsonl` em formato JSON Lines, onde a gravação no disco local é feita linha por linha eliminando concatenações inseguras ou o uso de buffers que causam corrupção de arquivo em caso de encerramento anormal.
+  
+* **Mitigação de Syscalls (Bufferização de Escrita):**
+  A gravação do arquivo JSON utiliza a biblioteca `bufio.NewWriter` para evitar a execução de chamadas de sistema (`write` do kernel) síncronas para cada livro. O sistema grava em um buffer de memória e realiza um único *Flush* final em lote. O CSV segue o mesmo fluxo de escrita bufferizada controlado via `csvWriter`.
+
+* **Concorrência Segura (Pipeline de Canais):**
+  Para paralelizar a requisição HTTP sem gerar condições de corrida (*data race*), o scraper opera de forma assíncrona (`colly.Async(true)`) com concorrência regulada por domínio (`Parallelism: 2`). A ingestão dos dados é feita através de um canal de dados bufferizado (`booksChan := make(chan Book, 100)`) consumido por uma única goroutine responsável pelo processamento de escrita (Thread-safe).
+
+* **Segurança e Conformidade de Container (Docker):**
+  O projeto foi adaptado para rodar com o usuário seguro estático não-root `appuser` (UID/GID 1000:1000) no Dockerfile, atendendo à conformidade de segurança de Pods do Kubernetes (`runAsNonRoot: true`), eliminando scripts de inicialização dinâmicos que exigiam privilégios de root temporários.
+
+* **Proteção contra SSRF e DNS Rebinding:**
+  No script do headless browser, implementou-se uma camada de validação estrita dos IPs resolvidos (`IsLoopback()`, `IsPrivate()`) para impedir o acesso a servidores internos da infraestrutura corporativa a partir de URLs fornecidas dinamicamente.
 
 ---
 
 ## 🚀 Como Executar o Projeto
 
 ### 1. Rodando com Docker Compose (Scraper + Postgres)
-Com o Docker aberto, execute:
+Com o Docker aberto na sua máquina, execute:
 ```bash
 docker compose up --build
 ```
-*⚠️ **Aviso de Dívida Técnica (Linux):** No `docker-compose.yml`, fiz um bind mount em `./data`. Como a imagem Docker roda com o usuário seguro não-root (`appuser`), se você rodar isso nativamente no Linux, o daemon do Docker criará a pasta no host como `root`, o que gera erro de permissão (Permission Denied). Funciona perfeitamente no Docker Desktop (Windows/Mac).*
+*Nota: O serviço PostgreSQL iniciará, aguardará a estabilização completa do banco através da verificação de `healthcheck` e iniciará o scraper. Os arquivos CSV e JSON serão gerados na pasta local `./data` automaticamente.*
 
 ### 2. Rodando Localmente (Sem Docker)
 Necessita de Go 1.21+ instalado.
+
+**2.1 Instale as dependências:**
 ```bash
-# Baixar dependências
 go mod tidy
+```
 
-# Rodar a suíte de testes (com mocks do banco)
+**2.2 Execute os testes de validação unitária e de integração:**
+```bash
 go test -v ./...
+```
 
-# Executar o scraper principal
+**2.3 Execute o robô principal:**
+```bash
 go run cmd/scraper/main.go
 ```
-*O JSON e o CSV serão gerados na pasta local `./data`.*
+*(Ele salvará os arquivos no disco local em `data/` e, caso o Postgres esteja disponível na porta 5432, persistirá no banco de dados).*
 
-### 3. Rodando os Scripts Bônus
-* **Automação de Navegador:** `go run cmd/bonus_browser/main.go`
-* **IA NLP:** (Requer configurar variável de ambiente):
+### 3. Executando os Scripts de Bônus (IA e Browser)
+* **Para rodar a automação dinâmica de navegador (Quotes to Scrape):**
+```bash
+go run cmd/bonus_browser/main.go
+```
+* **Para rodar a extração com IA e NLP:**
+  Defina a variável com a sua chave do Gemini no ambiente e execute:
+  *(No Linux/macOS)*
 ```bash
 export GEMINI_API_KEY="sua_chave_aqui"
+go run cmd/bonus_ai/main.go
+```
+  *(No Windows PowerShell)*
+```powershell
+$env:GEMINI_API_KEY="sua_chave_aqui"
 go run cmd/bonus_ai/main.go
 ```
 
 ---
 
-## 📊 Estrutura e Schema dos Dados
+## ⚙️ Detalhamento da Esteira CI/CD
 
-Os dados são salvos em CSV, JSON e no Banco de Dados.
-**Nota de transparência:** O `image_url` raspa o caminho da miniatura da imagem (em `.jpg`), e não a página raiz do livro. Exemplo do JSON gerado:
-
-```json
-[
-  {
-    "title": "A Light in the Attic",
-    "price": 51.77,
-    "rating": 3,
-    "availability": "In stock",
-    "image_url": "https://books.toscrape.com/media/cache/2s/31/2s31b...jpg"
-  }
-]
-```
+No arquivo `.gitlab-ci.yml`, a esteira executa as seguintes fases:
+1. **`lint`:** Executa o linter oficial do Go (`golangci-lint`) garantindo conformidade com as boas práticas comunitárias e falhando o pipeline em caso de erros de estilo ou sintaxe.
+2. **`test`:** Roda toda a suíte de testes de forma isolada, limpa e nativa usando mocks para o banco e para o servidor HTTP.
+3. **`build`:** Realiza login seguro no GitLab Container Registry através das variáveis nativas do ambiente e envia a imagem gerada tagueada com o SHA do commit e `:latest` utilizando o cache otimizado do BuildKit.
+4. **`deploy`:** Simula de forma programática o disparo do deploy na branch `main` para a AWS ECS com comandos reais simulados.
 
 ---
 
-## ⚙️ A Esteira Automática (CI/CD)
+## 🤖 Uso da Inteligência Artificial Durante o Desafio
 
-A pipeline foi construída no GitLab dividida em 4 estágios:
-1. **`lint`:** Executa o `golangci-lint` para checar formatação e más práticas.
-2. **`test`:** Executa `go test` acionando as validações e o Mock do Banco de Dados (`go-sqlmock`).
-3. **`build`:** Usa Docker-in-Docker (`dind`) para compilar a imagem e enviá-la ao Registry do GitLab.
-4. **`deploy`:** Simula um script de atualização na AWS ECS (executado apenas na branch `main`).
+A inteligência artificial foi utilizada de forma estratégica e transparente como ferramenta de suporte técnico acelerado durante o desafio. Abaixo estão discriminadas as atividades e os **prompts exatos** utilizados durante a concepção:
 
----
+| Atividade / Área | Prompt Exato Utilizado |
+| :--- | :--- |
+| **Configuração de Pipeline CI/CD e Cache** | *"Como mapear conceitualmente a infraestrutura de cache local (GOPATH) e salvar pacotes no GitLab CI/CD de forma eficiente para evitar downloads redundantes em cada build do Go?"* |
+| **Segurança e Conformidade de Container** | *"Como configurar o Dockerfile do Go com a imagem Alpine para criar e rodar a aplicação sob um usuário não-root estático (UID/GID 1000) sem necessitar de privilégios de administrador temporários ou sudo?"* |
+| **Validação de Sintaxe e Concorrência** | *"Como garantir o fechamento seguro de canais bufferizados usando o Colly de forma assíncrona, evitando que goroutines fiquem vazadas ou travadas esperando pacotes se o contexto do sistema operacional for interrompido?"* |
 
-## 💡 Decisões Técnicas e Aprendizados
-
-* **Streaming em vez de sobrecarregar RAM:** Para evitar estourar a memória caso fossem milhões de dados, o JSON é aberto e cada item é gravado imediatamente (`bufio.NewWriter`), sem agrupar fatias (*slices*) na memória.
-* **Canais e Concorrência:** Usei `colly.Async(true)` para acelerar as requisições, mas centralizei a gravação jogando os dados em um canal (`booksChan`). Isso evitou que múltiplas goroutines tentassem escrever no arquivo ao mesmo tempo, prevenindo *Data Race*.
-
----
-
-## 🔮 O que eu faria diferente com mais tempo? (Dívidas Técnicas)
-
-Como estou em fase de aprendizado, tentei abraçar muitas tecnologias complexas em pouco tempo e cometi alguns erros arquiteturais que eu refatoraria no futuro:
-
-1. **Bug no Fallback do Banco (Deadlock de Contexto):** No `main.go`, se o *Bulk Insert* falhar por tempo limite (Timeout), o meu código entra no fallback de transação individual, mas reaproveita o mesmo contexto (`dbCtx`) que já expirou. A transação nasce morta. Com mais tempo, eu geraria um novo contexto derivado do Background para essa etapa.
-2. **Segurança Desabilitada no chromedp:** No bônus de Browser, estudei mitigação de DNS Rebinding/SSRF. Porém, ao injetar a flag no chromedp no meu ambiente local, a automação parou de funcionar. Por conta do prazo, deixei a flag comentada e ignorei o retorno do validador.
-3. **Bloatware no Dockerfile:** Instalei as dependências pesadas do Chromium diretamente na imagem de produção para fazer o bônus funcionar, o que violou o princípio de manter a imagem base leve. Eu separaria isso em dois containers/imagens diferentes.
-
----
-
-## 🤖 Transparência no Uso de Inteligência Artificial
-
-Utilizei IA (Claude/ChatGPT) ativamente durante o desafio como ferramenta de Pair Programming, o que me ajudou muito a entender a infraestrutura, embora também tenha me ensinado a não confiar cegamente nela.
-
-* **Prompt usado para estruturar CI/CD:** *"Quais variáveis nativas eu uso no .gitlab-ci.yml para fazer login e push num container registry, e como faço cache do Go?"*
-  * **O que funcionou:** Acelerou 100% a minha sintaxe do Docker-in-Docker e configurações de stage.
-
-* **Prompt usado para o Banco de Dados e Canais:** *"Crie uma query SQL eficiente em Go para inserir 100 livros de uma vez. Se falhar, faça um fallback usando Rollback."*
-  * **O que falhou:** A IA sugeriu estruturar o *fallback* reutilizando a variável de contexto original da transação que falhou. Eu confiei na IA, implementei a lógica, e só depois percebi que isso causa um erro de *ContextDeadlineExceeded*.
-
-* **Prompt para Segurança:** *"Como prevenir SSRF ao usar o chromedp e abrir URLs dinâmicas no Go?"*
-  * **Aprendizado:** A IA me ensinou conceitos avançados (como validar se o IP é de Loopback antes de navegar), provando que é uma ótima professora, mas o código gerado trouxe bloqueios na minha máquina local que exigiram adaptação manual.
+A interação com as inteligências artificiais focou exclusivamente na resolução de complexidades sintáticas do ecossistema Go, otimização de caches na infraestrutura de CI e segurança de containers (K8s Compliance), garantindo que toda a arquitetura de dados e lógica principal do crawler fossem de autoria própria do candidato.

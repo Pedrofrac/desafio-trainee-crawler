@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"database/sql"
 	"encoding/csv"
@@ -20,7 +19,6 @@ import (
 	"time"
 
 	"github.com/gocolly/colly/v2"
-	_ "github.com/lib/pq"
 )
 
 type Book struct {
@@ -31,71 +29,55 @@ type Book struct {
 	ImageURL     string  `json:"image_url"`
 }
 
-var priceRegex = regexp.MustCompile(`[0-9]+(?:\.[0-9]{1,2})?`)
-
-var ratingsMap = map[string]int{
-	"One":   1,
-	"Two":   2,
-	"Three": 3,
-	"Four":  4,
-	"Five":  5,
-}
-
 var (
-	queryCache = make(map[int]string)
-	cacheMu    sync.RWMutex
+	// Compilada globalmente para evitar queima de CPU em loops
+	nonNumericRegex = regexp.MustCompile(`[^\d.,]`)
+
+	ratingsMap = map[string]int{
+		"one":   1,
+		"two":   2,
+		"three": 3,
+		"four":  4,
+		"five":  5,
+	}
 )
 
-func getInsertQuery(n int) string {
-	if n <= 0 {
-		return ""
-	}
-
-	cacheMu.RLock()
-	q, ok := queryCache[n]
-	cacheMu.RUnlock()
-	if ok {
-		return q
-	}
-
-	cacheMu.Lock()
-	defer cacheMu.Unlock()
-	
-	if q, ok = queryCache[n]; ok {
-		return q
-	}
-
-	var sb strings.Builder
-	sb.Grow(n * 35)
-	sb.WriteString("INSERT INTO books (title, price, rating, availability, image_url) VALUES ")
-	for j := 0; j < n; j++ {
-		if j > 0 {
-			sb.WriteString(",")
-		}
-		offset := j * 5
-		sb.WriteString("($")
-		sb.WriteString(strconv.Itoa(offset + 1))
-		sb.WriteString(",$")
-		sb.WriteString(strconv.Itoa(offset + 2))
-		sb.WriteString(",$")
-		sb.WriteString(strconv.Itoa(offset + 3))
-		sb.WriteString(",$")
-		sb.WriteString(strconv.Itoa(offset + 4))
-		sb.WriteString(",$")
-		sb.WriteString(strconv.Itoa(offset + 5))
-		sb.WriteString(")")
-	}
-	sb.WriteString(" ON CONFLICT (image_url) DO NOTHING")
-	queryCache[n] = sb.String()
-	return queryCache[n]
-}
-
 func cleanPrice(priceStr string) (float64, error) {
-	match := priceRegex.FindString(priceStr)
-	if match == "" {
+	cleaned := nonNumericRegex.ReplaceAllString(priceStr, "")
+	if cleaned == "" {
 		return 0.0, fmt.Errorf("padrao de preco nao encontrado no texto: %s", priceStr)
 	}
-	val, err := strconv.ParseFloat(match, 64)
+
+	lastDot := strings.LastIndex(cleaned, ".")
+	lastComma := strings.LastIndex(cleaned, ",")
+
+	sepIndex := lastDot
+	if lastComma > lastDot {
+		sepIndex = lastComma
+	}
+
+	var integerPart, fractionalPart string
+
+	// Se houver um separador e ele estiver exatamente a 2 posições do final, é uma casa decimal
+	if sepIndex != -1 && len(cleaned)-1-sepIndex == 2 {
+		integerPart = cleaned[:sepIndex]
+		fractionalPart = cleaned[sepIndex+1:]
+	} else {
+		// Caso contrário, são apenas separadores de milhar (ex: 1,000 ou 1.000) ou um número inteiro
+		integerPart = cleaned
+		fractionalPart = "00"
+	}
+
+	// Remove todos os separadores remanescentes da parte inteira
+	integerPart = strings.ReplaceAll(integerPart, ".", "")
+	integerPart = strings.ReplaceAll(integerPart, ",", "")
+
+	if integerPart == "" {
+		integerPart = "0"
+	}
+
+	finalStr := integerPart + "." + fractionalPart
+	val, err := strconv.ParseFloat(finalStr, 64)
 	if err != nil {
 		return 0.0, fmt.Errorf("erro ao converter preco para float: %w", err)
 	}
@@ -103,7 +85,7 @@ func cleanPrice(priceStr string) (float64, error) {
 }
 
 func mapRating(classStr string) int {
-	parts := strings.Fields(classStr)
+	parts := strings.Fields(strings.ToLower(classStr))
 	for _, part := range parts {
 		if val, ok := ratingsMap[part]; ok {
 			return val
@@ -113,13 +95,30 @@ func mapRating(classStr string) int {
 	return 0
 }
 
-func setupDatabase() (*sql.DB, error) {
+func runMigrations(ctx context.Context, db *sql.DB) error {
+	migCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	const schema = `CREATE TABLE IF NOT EXISTS books (
+		id SERIAL PRIMARY KEY, 
+		title TEXT, 
+		price NUMERIC, 
+		rating INT, 
+		availability TEXT, 
+		image_url TEXT UNIQUE
+	)`
+
+	if _, err := db.ExecContext(migCtx, schema); err != nil {
+		return fmt.Errorf("falha ao executar migracao de schema: %w", err)
+	}
+	return nil
+}
+
+func setupDatabase(ctx context.Context) (*sql.DB, error) {
 	dbHost := os.Getenv("DB_HOST")
 	if dbHost == "" { dbHost = "localhost" }
-	
 	dbPort := os.Getenv("DB_PORT")
 	if dbPort == "" { dbPort = "5432" }
-
 	dbSSLMode := os.Getenv("DB_SSLMODE")
 	if dbSSLMode == "" { dbSSLMode = "disable" }
 
@@ -132,14 +131,12 @@ func setupDatabase() (*sql.DB, error) {
 	}
 
 	u := &url.URL{
-		Scheme: "postgres",
-		User:   url.UserPassword(dbUser, dbPass),
-		Host:   fmt.Sprintf("%s:%s", dbHost, dbPort),
-		Path:   "/" + dbName,
+		Scheme:   "postgres",
+		User:     url.UserPassword(dbUser, dbPass),
+		Host:     fmt.Sprintf("%s:%s", dbHost, dbPort),
+		Path:     "/" + dbName,
+		RawQuery: "sslmode=" + dbSSLMode,
 	}
-	q := u.Query()
-	q.Set("sslmode", dbSSLMode)
-	u.RawQuery = q.Encode()
 
 	db, err := sql.Open("postgres", u.String())
 	if err != nil {
@@ -150,162 +147,181 @@ func setupDatabase() (*sql.DB, error) {
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(15 * time.Minute)
 
-	if err := db.Ping(); err != nil {
+	setupCtx, cancelSetup := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelSetup()
+
+	if err := db.PingContext(setupCtx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("erro de ping no banco: %w", err)
 	}
 
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS books (
-		id SERIAL PRIMARY KEY, title TEXT, price NUMERIC, rating INT, availability TEXT, image_url TEXT UNIQUE
-	)`)
-	if err != nil {
+	if err := runMigrations(ctx, db); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("erro ao criar tabela: %w", err)
+		return nil, err
 	}
 
 	return db, nil
 }
 
-func saveBooksInBatch(ctx context.Context, db *sql.DB, books []Book) {
-	if len(books) == 0 {
-		return
+// Retorna uma lista de livros que falharam para serem processados pela DLQ assíncrona
+func saveBooksInBatch(ctx context.Context, db *sql.DB, batch []Book) []Book {
+	if len(batch) == 0 {
+		return nil
 	}
 
-	for i := 0; i < len(books); i += 100 {
-		end := i + 100
-		if end > len(books) {
-			end = len(books)
-		}
-		batch := books[i:end]
-		n := len(batch)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		slog.Error("Erro ao iniciar transacao no banco", "erro", err)
+		return batch
+	}
+	defer tx.Rollback()
 
-		valueArgs := make([]interface{}, 0, n*5)
-		for _, b := range batch {
-			valueArgs = append(valueArgs, b.Title, b.Price, b.Rating, b.Availability, b.ImageURL)
-		}
+	stmt, err := tx.PrepareContext(ctx, "INSERT INTO books (title, price, rating, availability, image_url) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (image_url) DO NOTHING")
+	if err != nil {
+		slog.Error("Erro ao preparar statement para insercao", "erro", err)
+		return batch
+	}
+	defer stmt.Close()
 
-		dbCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-
-		stmtStr := getInsertQuery(n)
-		if stmtStr == "" {
-			slog.Warn("Query de bulk vazia. Abortando lote.")
-			cancel() 
+	var failedBooks []Book
+	for _, b := range batch {
+		if ctx.Err() != nil {
+			failedBooks = append(failedBooks, b)
 			continue
 		}
 
-		if _, err := db.ExecContext(dbCtx, stmtStr, valueArgs...); err != nil {
-			slog.Error("Erro no bulk insert de lote. Iniciando fallback de transação individual...", "erro", err)
-			
-			tx, txErr := db.BeginTx(dbCtx, nil)
-			if txErr != nil {
-				slog.Error("Erro ao abrir transacao de fallback", "erro", txErr)
-				cancel()
-				continue
-			}
-
-			stmt, prepErr := tx.PrepareContext(dbCtx, "INSERT INTO books (title, price, rating, availability, image_url) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (image_url) DO NOTHING")
-			if prepErr != nil {
-				slog.Error("Erro ao preparar statement de fallback", "erro", prepErr)
-				_ = tx.Rollback()
-				cancel()
-				continue
-			}
-
-			// CORRIGIDO: Iterando estritamente sobre o 'batch' atual em vez de 'books' (evita repetições indevidas no fallback)
-			for _, b := range batch {
-				if dbCtx.Err() != nil {
-					slog.Warn("Cancelando inserções individuais de fallback: contexto de rede expirado.")
-					break
-				}
-				if _, err := stmt.ExecContext(dbCtx, b.Title, b.Price, b.Rating, b.Availability, b.ImageURL); err != nil {
-					slog.Error("Erro ao salvar livro individual no fallback (Ignorado)", "livro", b.Title, "erro", err)
-				}
-			}
-			stmt.Close()
-			if err := tx.Commit(); err != nil {
-				slog.Error("Erro ao comitar transacao de fallback", "erro", err)
-			}
+		if _, err := stmt.ExecContext(ctx, b.Title, b.Price, b.Rating, b.Availability, b.ImageURL); err != nil {
+			slog.Error("Falha individual no banco. Destinando a DLQ.", "livro", b.Title, "erro", err)
+			failedBooks = append(failedBooks, b)
 		}
-		cancel() 
 	}
+
+	if err := tx.Commit(); err != nil {
+		slog.Error("Erro ao confirmar transacao em lote", "erro", err)
+		return batch
+	}
+	return failedBooks
 }
 
 func startPipeline(ctx context.Context, db *sql.DB, csvWriter *csv.Writer, fileCSV *os.File, jsonFile *os.File) (chan<- Book, *sync.WaitGroup) {
 	booksChan := make(chan Book, 100)
+	dlqChan := make(chan Book, 1000)
 	var wg sync.WaitGroup
+
+	var wgDLQ sync.WaitGroup
+	wgDLQ.Add(1)
+	go func() {
+		defer wgDLQ.Done()
+
+		f, err := os.OpenFile("data/dlq.jsonl", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0640)
+		if err != nil {
+			slog.Error("ERRO FATAL ao abrir arquivo DLQ. Abortando processo de execucao para evitar perda de dados.", "erro", err)
+			os.Exit(1)
+		}
+		defer f.Close()
+
+		encoder := json.NewEncoder(f)
+		for b := range dlqChan {
+			if err := encoder.Encode(b); err != nil {
+				slog.Error("Erro ao gravar livro na DLQ", "erro", err, "livro", b.Title)
+			}
+		}
+		if err := f.Sync(); err != nil {
+			slog.Error("Erro ao aplicar fsync na DLQ", "erro", err)
+		}
+	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		
-		jsonWriter := bufio.NewWriter(jsonFile)
+
+		jsonEncoder := json.NewEncoder(jsonFile)
+
+		var wgDB sync.WaitGroup
+		semDB := make(chan struct{}, 5) // Semáforo limitador para mitigar Memory Leak de Goroutines
 
 		defer func() {
+			wgDB.Wait()
+			close(dlqChan)
+			wgDLQ.Wait()
+
+			if err := jsonFile.Sync(); err != nil {
+				slog.Error("Erro ao forcar sincronizacao fisica do arquivo JSON", "erro", err)
+			}
+
 			csvWriter.Flush()
 			if err := csvWriter.Error(); err != nil {
 				slog.Error("Erro de gravacao pendente no CSV", "erro", err)
 			}
 			if err := fileCSV.Sync(); err != nil {
-				slog.Error("Erro ao forcar sincronizacao fisica do arquivo CSV (fsync)", "erro", err)
-			}
-
-			// CORRIGIDO: Escreve o fechamento do array JSON no final do arquivo
-			if _, err := jsonWriter.WriteString("\n]\n"); err != nil {
-				slog.Error("Erro ao finalizar array JSON", "erro", err)
-			}
-			if err := jsonWriter.Flush(); err != nil {
-				slog.Error("Erro ao dar flush no buffer do JSON", "erro", err)
-			}
-			if err := jsonFile.Sync(); err != nil {
-				slog.Error("Erro ao forcar sincronizacao fisica do arquivo JSON (fsync)", "erro", err)
+				slog.Error("Erro ao forcar sincronizacao fisica do arquivo CSV", "erro", err)
 			}
 		}()
 
-		// CORRIGIDO: Inicializa o arquivo como um array JSON válido sem carregar tudo em RAM
-		if _, err := jsonWriter.WriteString("[\n"); err != nil {
-			slog.Error("Erro ao iniciar array no JSON", "erro", err)
-		}
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
 
-		chunk := make([]Book, 0, 100) 
-		isFirstJSON := true
+		chunk := make([]Book, 0, 100)
 
-		for b := range booksChan {
-			if err := csvWriter.Write([]string{b.Title, fmt.Sprintf("%.2f", b.Price), strconv.Itoa(b.Rating), b.Availability, b.ImageURL}); err != nil {
-				slog.Error("Erro ao escrever linha no CSV", "erro", err)
-			}
+		for {
+			select {
+			case b, ok := <-booksChan:
+				if !ok {
+					if db != nil && len(chunk) > 0 {
+						batch := make([]Book, len(chunk))
+						copy(batch, chunk)
 
-			// CORRIGIDO: Transforma o fluxo contínuo de dados em um array estruturado válido
-			if !isFirstJSON {
-				if _, err := jsonWriter.WriteString(",\n"); err != nil {
-					slog.Error("Erro ao injetar delimitador no JSON", "erro", err)
+						semDB <- struct{}{}
+						wgDB.Add(1)
+						go func(data []Book) {
+							defer wgDB.Done()
+							flushCtx, flushCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+							failed := saveBooksInBatch(flushCtx, db, data)
+							flushCancel()
+							<-semDB // Liberado ANTES da DLQ para prevenir Deadlock lógico
+
+							for _, fb := range failed {
+								dlqChan <- fb
+							}
+						}(batch)
+					}
+					return
 				}
-			}
-			isFirstJSON = false
 
-			bBytes, err := json.MarshalIndent(b, "  ", "  ")
-			if err != nil {
-				slog.Error("Erro ao codificar JSON do livro", "erro", err)
-			} else {
-				if _, err := jsonWriter.Write(bBytes); err != nil {
-					slog.Error("Erro ao persistir bloco JSON", "erro", err)
+				if err := csvWriter.Write([]string{b.Title, fmt.Sprintf("%.2f", b.Price), strconv.Itoa(b.Rating), b.Availability, b.ImageURL}); err != nil {
+					slog.Error("Erro ao escrever linha no CSV", "erro", err)
 				}
-			}
 
-			if db != nil {
-				chunk = append(chunk, b)
-				if len(chunk) >= 100 {
-					flushCtx, flushCancel := context.WithTimeout(context.Background(), 15*time.Second)
-					saveBooksInBatch(flushCtx, db, chunk)
-					flushCancel()
-					chunk = chunk[:0] 
+				if err := jsonEncoder.Encode(b); err != nil {
+					slog.Error("Erro ao persistir bloco JSONL", "erro", err)
 				}
-			}
-		}
 
-		if db != nil && len(chunk) > 0 {
-			flushCtx, flushCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			saveBooksInBatch(flushCtx, db, chunk)
-			flushCancel()
+				if db != nil {
+					chunk = append(chunk, b)
+					if len(chunk) >= 100 {
+						batch := make([]Book, len(chunk))
+						copy(batch, chunk)
+						chunk = chunk[:0]
+
+						semDB <- struct{}{}
+						wgDB.Add(1)
+						go func(data []Book) {
+							defer wgDB.Done()
+							flushCtx, flushCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+							failed := saveBooksInBatch(flushCtx, db, data)
+							flushCancel()
+							<-semDB // Liberado ANTES da DLQ
+
+							for _, fb := range failed {
+								dlqChan <- fb
+							}
+						}(batch)
+					}
+				}
+
+			case <-ticker.C:
+				csvWriter.Flush()
+			}
 		}
 	}()
 
@@ -316,12 +332,15 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
-	
+
 	srv := &http.Server{
 		Addr:         ":8080",
 		Handler:      mux,
@@ -330,13 +349,27 @@ func main() {
 		IdleTimeout:  30 * time.Second,
 	}
 
+	errChan := make(chan error, 1)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Error("Erro no servidor de Health Check", "erro", err)
+			slog.Error("Erro FATAL no servidor de Health Check", "erro", err)
+			errChan <- err
 		}
 	}()
 
-	db, err := setupDatabase()
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		select {
+		case <-sigChan:
+			slog.Warn("Sinal de término recebido. Cancelando contexto de requisições...")
+		case err := <-errChan:
+			slog.Error("Servidor HTTP falhou. Iniciando graceful shutdown...", "erro", err)
+		}
+		cancel()
+	}()
+
+	db, err := setupDatabase(ctx)
 	if err != nil {
 		slog.Warn("Banco indisponivel. Operando em disco plano.", "erro", err)
 	} else {
@@ -361,29 +394,18 @@ func main() {
 		return
 	}
 
-	// CORRIGIDO: Salvando como arquivo '.json' estrito e bem formatado
-	fileJSON, err := os.OpenFile("data/books.json", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0640)
+	// Adotado padrão JSONL em vez de Array manual
+	fileJSON, err := os.OpenFile("data/books.jsonl", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0640)
 	if err != nil {
 		slog.Error("Erro ao criar arquivo JSON", "erro", err)
 		return
 	}
 	defer fileJSON.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	booksChan, wg := startPipeline(ctx, db, csvWriter, fileCSV, fileJSON)
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigChan
-		slog.Warn("Sinal de término recebido. Cancelando contexto de requisições...")
-		cancel() 
-	}()
-
 	c := colly.NewCollector(
-		colly.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+		colly.UserAgent("ScraperTraineeBot/1.0 (+https://github.com/trainee/scraper)"),
 		colly.Async(true),
 	)
 
@@ -401,12 +423,16 @@ func main() {
 
 	parallelism := 2
 	if val := os.Getenv("SCRAPER_PARALLELISM"); val != "" {
-		if v, err := strconv.Atoi(val); err == nil { parallelism = v }
+		if v, err := strconv.Atoi(val); err == nil {
+			parallelism = v
+		}
 	}
 
 	delay := 1 * time.Second
 	if val := os.Getenv("SCRAPER_DELAY"); val != "" {
-		if d, err := time.ParseDuration(val); err == nil { delay = d }
+		if d, err := time.ParseDuration(val); err == nil {
+			delay = d
+		}
 	}
 
 	if err := c.Limit(&colly.LimitRule{DomainGlob: "*", Parallelism: parallelism, RandomDelay: delay}); err != nil {
@@ -419,18 +445,25 @@ func main() {
 			return
 		}
 
+		title := e.ChildAttr("h3 a", "title")
 		priceCleaned, err := cleanPrice(e.ChildText(".price_color"))
 		if err != nil {
-			slog.Error("Erro ao limpar preco do livro", "livro", e.ChildAttr("h3 a", "title"), "erro", err)
+			slog.Error("Erro ao limpar preco do livro", "livro", title, "erro", err)
 			return
 		}
 
+		imgURL := e.Request.AbsoluteURL(e.ChildAttr(".image_container img", "src"))
+		// Restabelece a idempotência real substituindo URLs vazias por chaves geradas em hash
+		if imgURL == "" || strings.HasSuffix(imgURL, "/") {
+			imgURL = "no-image-url:title:" + url.PathEscape(title)
+		}
+
 		book := Book{
-			Title:        e.ChildAttr("h3 a", "title"),
+			Title:        title,
 			Price:        priceCleaned,
 			Rating:       mapRating(e.ChildAttr("p.star-rating", "class")),
 			Availability: strings.TrimSpace(e.ChildText(".instock.availability")),
-			ImageURL:     e.Request.AbsoluteURL(e.ChildAttr(".image_container img", "src")),
+			ImageURL:     imgURL,
 		}
 
 		select {
@@ -455,11 +488,13 @@ func main() {
 		return
 	}
 
-	c.Wait()         
-	close(booksChan) 
-	wg.Wait()        
+	go func() {
+		c.Wait()
+		close(booksChan)
+	}()
+	wg.Wait()
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		slog.Error("Erro ao desligar servidor de Health Check", "erro", err)

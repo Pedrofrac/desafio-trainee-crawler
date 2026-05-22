@@ -1,13 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/csv"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"strings" // CORRIGIDO: Importação adicionada para evitar erro de compilação
+	"strings"
+	"sync"
 	"testing"
-	"context"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gocolly/colly/v2"
@@ -21,6 +23,7 @@ func TestCleanPrice(t *testing.T) {
 		hasError bool
 	}{
 		{"Preço normal", "£12.99", 12.99, false},
+		{"Preço com milhares", "£1,000.50", 1000.50, false},
 		{"Preço com bug de encoding", "Â£45.17", 45.17, false},
 		{"String vazia", "", 0.0, true},
 		{"Texto invalido", "grátis", 0.0, true},
@@ -45,9 +48,9 @@ func TestMapRating(t *testing.T) {
 		input    string
 		expected int
 	}{
-		{"Uma estrela", "star-rating One", 1},
-		{"Tres estrelas", "star-rating Three", 3},
-		{"Cinco estrelas", "star-rating Five", 5},
+		{"Uma estrela uppercase", "star-rating One", 1},
+		{"Tres estrelas lowercase", "star-rating three", 3},
+		{"Cinco estrelas mista", "star-rating fIvE", 5},
 		{"Classe invalida", "star-rating Invalido", 0},
 	}
 
@@ -68,9 +71,12 @@ func TestStartPipelineWithMock(t *testing.T) {
 	}
 	defer db.Close()
 
-	mock.ExpectExec("INSERT INTO books").
-		WithArgs("Livro de Teste", 15.50, 4, "In stock", "http://imagem.com/teste.jpg").
+	mock.ExpectBegin()
+	mock.ExpectPrepare(`INSERT INTO books`)
+	mock.ExpectExec(`INSERT INTO books`).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
 
 	fCSV, err := os.CreateTemp("", "test_csv")
 	if err != nil {
@@ -78,7 +84,7 @@ func TestStartPipelineWithMock(t *testing.T) {
 	}
 	fJSON, err := os.CreateTemp("", "test_jsonl")
 	if err != nil {
-		t.Fatalf("Erro ao criar JSONL temporario: %s", err)
+		t.Fatalf("Erro ao criar JSON temporario: %s", err)
 	}
 	defer fCSV.Close()
 	defer fJSON.Close()
@@ -87,7 +93,10 @@ func TestStartPipelineWithMock(t *testing.T) {
 
 	csvWriter := csv.NewWriter(fCSV)
 
-	booksChan, wg := startPipeline(context.Background(), db, csvWriter, fCSV, fJSON)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	booksChan, wg := startPipeline(ctx, db, csvWriter, fCSV, fJSON)
 
 	booksChan <- Book{
 		Title:        "Livro de Teste",
@@ -99,6 +108,38 @@ func TestStartPipelineWithMock(t *testing.T) {
 
 	close(booksChan)
 	wg.Wait()
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("Expectativas do banco nao atendidas: %s", err)
+	}
+}
+
+func TestSaveBooksInBatch(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("Erro ao iniciar mock: %s", err)
+	}
+	defer db.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectPrepare(`INSERT INTO books`)
+	mock.ExpectExec(`INSERT INTO books`).
+		WithArgs("Livro Principal", 20.0, 3, "In stock", "http://imagem.com/principal.jpg").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	batch := []Book{{
+		Title:        "Livro Principal",
+		Price:        20.0,
+		Rating:       3,
+		Availability: "In stock",
+		ImageURL:     "http://imagem.com/principal.jpg",
+	}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	saveBooksInBatch(ctx, db, batch)
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("Expectativas do banco nao atendidas: %s", err)
@@ -124,8 +165,11 @@ func TestCollyParserWithMockServer(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	c := colly.NewCollector()
+	c := colly.NewCollector(
+		colly.Async(true),
+	)
 	var parsedBooks []Book
+	var mu sync.Mutex
 
 	c.OnHTML("article.product_pod", func(e *colly.HTMLElement) {
 		priceCleaned, err := cleanPrice(e.ChildText(".price_color"))
@@ -141,13 +185,21 @@ func TestCollyParserWithMockServer(t *testing.T) {
 			Availability: strings.TrimSpace(e.ChildText(".instock.availability")),
 			ImageURL:     e.Request.AbsoluteURL(e.ChildAttr(".image_container img", "src")),
 		}
+		
+		mu.Lock()
 		parsedBooks = append(parsedBooks, book)
+		mu.Unlock()
 	})
 
 	err := c.Visit(ts.URL)
 	if err != nil {
 		t.Fatalf("Erro ao visitar servidor de testes: %s", err)
 	}
+
+	c.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
 
 	if len(parsedBooks) != 1 {
 		t.Fatalf("Esperava 1 livro processado, mas recebeu %d", len(parsedBooks))

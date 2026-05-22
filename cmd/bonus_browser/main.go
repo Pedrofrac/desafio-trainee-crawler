@@ -38,7 +38,9 @@ func main() {
 		}
 	}
 
-	targetURL, _, err := security.ValidateTargetURL(context.Background(), os.Getenv("BROWSER_TARGET_URL"))
+	validationCtx, validationCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	targetURL, _, err := security.ValidateTargetURL(validationCtx, os.Getenv("BROWSER_TARGET_URL"))
+	validationCancel()
 	if err != nil {
 		slog.Warn("URL de destino invalida ou nao segura. Fallback para site seguro executado.", "erro", err)
 		targetURL = "http://quotes.toscrape.com/js/"

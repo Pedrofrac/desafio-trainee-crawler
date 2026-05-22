@@ -18,3 +18,5 @@ main.go_v1.txt
 *.exe
 *.test
 .env
+a.py
+b.py
