@@ -152,6 +152,26 @@ No arquivo `.gitlab-ci.yml`, a esteira executa as seguintes fases:
 
 ---
 
+## 🔮 O que eu faria diferente com mais tempo (Melhorias de Produção)
+
+Embora o robô esteja 100% funcional, estruturado em arquitetura concorrente e em conformidade com o edital do desafio, o processo de refatoração para um ambiente de produção corporativo real (Go-live) contemplaria as seguintes evoluções técnicas:
+
+### 1. Otimização de Performance no Ingestão em Massa (Bulk Ingestion)
+Atualmente, a persistência de dados em lote no banco PostgreSQL utiliza uma chamada de transação com preparação de query dinâmica (`PrepareContext`):
+* **O que seria alterado:** Substituição do fluxo de preparação de instrução pela execução direta via `tx.ExecContext(ctx, queryStr, vals...)`.
+* **Motivação:** Como o tamanho dos lotes de livros pode variar (ex: o último lote para limpar o canal pode conter menos de 100 livros), o formato da query string muda. Preparar instruções SQL cujo formato varia a cada chamada força o PostgreSQL a analisar e planejar planos de execução que nunca serão reutilizados. A remoção do `Prepare` elimina uma viagem de rede (RTT) extra por lote e evita o consumo inútil de memória de sessões do banco de dados.
+
+### 2. Endurecimento de Segurança de Rede (Transport Encryption)
+O banco de dados local utiliza a flag de ambiente padrão `sslmode=disable` para fins de sandbox de desenvolvimento:
+* **O que seria alterado:** Em ambientes de Homologação (Staging) ou Produção dentro do AWS ECS, o parser de credenciais do banco exigiria estritamente conexões criptografadas de forma mandatória (`sslmode=require` ou `sslmode=verify-full`).
+* **Motivação:** Mitigar o risco de interceptação de tráfego de dados e credenciais de acesso (*man-in-the-middle*) ao transitar informações fora de redes privadas isoladas.
+
+### 3. Automação de Qualidade de Código (Lint & Format)
+* **O que seria alterado:** Integração de ganchos de pré-commit locais (*Git Hooks*) executando `go fmt` e `goimports` antes de qualquer commit no Git.
+* **Motivação:** Garantir a formatação visual e ordenação de imports estrita conforme o padrão oficial Go de forma 100% automatizada, eliminando pequenas imperfeições de identação na declaração de pacotes globais ou blocos de inicialização (como o mapa de ratings do scraper) antes do envio ao code review.
+
+---
+
 ## 🤖 Uso da Inteligência Artificial Durante o Desafio
 
 A inteligência artificial foi utilizada de forma estratégica e transparente como ferramenta de suporte técnico acelerado durante o desafio. Abaixo estão discriminadas as atividades e os **prompts exatos** utilizados durante a concepção:
